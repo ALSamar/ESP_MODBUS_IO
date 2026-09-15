@@ -1,0 +1,26 @@
+menu "USB Modbus IO"
+
+config USB_MODBUS_SLAVE_ADDRESS
+    int "Modbus slave address"
+    range 1 247
+    default 1
+    help
+        Modbus RTU unit address used on the USB CDC virtual serial port.
+
+config USB_MODBUS_INTERFRAME_TIMEOUT_MS
+    int "Incomplete frame timeout in milliseconds"
+    range 2 1000
+    default 20
+    help
+        Time after which an incomplete USB byte stream is discarded. A complete
+        request is processed immediately from its function-specific length.
+
+config USB_MODBUS_ENABLE_GPIO35_37
+    bool "Enable GPIO35 GPIO36 and GPIO37"
+    default n
+    help
+        Enable only when the fitted ESP32-S3 module does not use these pins for
+        Octal flash or Octal PSRAM. N8R8 and N16R8 modules normally need these
+        pins reserved. The Modbus channel numbers remain stable either way.
+
+endmenu

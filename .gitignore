@@ -1,0 +1,30 @@
+# ESP-IDF generated files and downloaded managed components
+/build/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+
+# Packaged applications and release artifacts
+/dist/
+/out/
+/*.bin
+/*.elf
+/*.map
+
+# Local document rendering and QA output
+/.qa/
+
+# Python caches and packaging output
+__pycache__/
+*.py[cod]
+*.egg-info/
+/.pytest_cache/
+/.mypy_cache/
+
+# Editors and operating systems
+/.vscode/
+/.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
