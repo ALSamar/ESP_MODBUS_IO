@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
+from zipfile import ZipFile
 
 from docx import Document
 from docx.enum.section import WD_SECTION_START
@@ -13,9 +15,7 @@ from docx.shared import Cm, Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "ESP32-S3_USB_Modbus_IO_Protocol.docx"
-BOARD_IMAGE = Path(
-    r"C:\Users\al182\AppData\Local\Temp\codex-clipboard-cffef77b-80c4-43f5-947d-564f35cb61a6.png"
-)
+BOARD_IMAGE = ROOT / "docs" / "assets" / "esp32-s3-board.png"
 
 NAVY = "1F4E78"
 PALE_BLUE = "EAF2F8"
@@ -335,17 +335,31 @@ def configure_document(doc: Document) -> None:
     left, right = footer_table.rows[0].cells
     set_cell_width(left, 5.8)
     set_cell_width(right, 1.26)
-    style_run(left.paragraphs[0].add_run("ESP32-S3 USB Modbus IO 协议 1.0"), size=8.5)
+    style_run(left.paragraphs[0].add_run("ESP32-S3 USB Modbus IO 协议 1.1"), size=8.5)
     add_page_number(right.paragraphs[0])
 
 
-def build() -> None:
+def preserve_board_image(board_image: Path) -> Path:
+    """Migrate the original embedded photo once; retain a portable source asset."""
+    if board_image.exists():
+        return board_image
+    if board_image == BOARD_IMAGE and OUTPUT.exists():
+        with ZipFile(OUTPUT) as existing:
+            photo = existing.read("word/media/image1.png")
+        board_image.parent.mkdir(parents=True, exist_ok=True)
+        board_image.write_bytes(photo)
+        return board_image
+    raise FileNotFoundError(f"Board image missing: {board_image}; use --board-image PATH")
+
+
+def build(board_image: Path = BOARD_IMAGE) -> None:
+    board_image = preserve_board_image(board_image)
     doc = Document()
     configure_document(doc)
     doc.core_properties.title = "ESP32-S3 USB Modbus IO 通信协议"
     doc.core_properties.subject = "ESP-IDF 固件通信与寄存器说明"
     doc.core_properties.author = "ESP32-S3 USB Modbus IO Project"
-    doc.core_properties.keywords = "ESP32-S3, ESP-IDF, Modbus RTU, USB CDC, GPIO, ADC"
+    doc.core_properties.keywords = "ESP32-S3, ESP-IDF, Modbus RTU, USB CDC, GPIO, ADC, PWM"
 
     title = doc.add_paragraph(style="Title")
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -356,19 +370,19 @@ def build() -> None:
 
     meta = doc.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    style_run(meta.add_run("协议版本 1.0    固件版本 1.0    从站地址 1"), size=10, bold=True)
+    style_run(meta.add_run("协议版本 1.1    固件版本 1.1    从站地址 1"), size=10, bold=True)
 
     add_body(
         doc,
         "本手册给出图示 ESP32-S3-WROOM-1 开发板的 USB 虚拟串口 Modbus RTU 接口。"
         "主站可读取数字输入和输出状态、控制数字输出、读取 GPIO1 到 GPIO18 的 ADC 数据，"
-        "并通过保持寄存器设置每个通道的工作模式。",
+        "并配置 PWM 频率、占空比和启停状态。版本 1.1 保留 1.0 的数字 IO 和 ADC 地址。",
     )
 
-    if BOARD_IMAGE.exists():
+    if board_image.exists():
         image_paragraph = doc.add_paragraph()
         image_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        picture = image_paragraph.add_run().add_picture(str(BOARD_IMAGE), width=Inches(5.35))
+        picture = image_paragraph.add_run().add_picture(str(board_image), width=Inches(5.35))
         picture._inline.docPr.set("descr", "ESP32-S3-WROOM-1 双 USB-C 开发板引脚图")
         caption = doc.add_paragraph()
         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -394,6 +408,7 @@ def build() -> None:
             ["不完整帧超时", "20 ms", "完整帧立即处理"],
             ["数字通道", "34", "默认可用 31 个，GPIO35 到 GPIO37 保留"],
             ["模拟通道", "18", "GPIO1 到 GPIO18"],
+            ["PWM 输出", "最多 8 路", "同时最多 4 种频率；10 Hz 到 100 kHz"],
         ],
         [1.45, 1.55, 4.0],
         [WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT],
@@ -450,12 +465,12 @@ def build() -> None:
         [
             ["0x01", "Read Coils", "读取数字输出命令状态"],
             ["0x02", "Read Discrete Inputs", "读取 GPIO 实际逻辑电平"],
-            ["0x03", "Read Holding Registers", "读取模式、GPIO 映射和设备信息"],
+            ["0x03", "Read Holding Registers", "读取模式、GPIO 映射、设备信息和 PWM 配置"],
             ["0x04", "Read Input Registers", "读取 ADC 原始值或校准毫伏值"],
             ["0x05", "Write Single Coil", "设置一个数字输出并自动进入输出模式"],
             ["0x06", "Write Single Register", "设置一个 GPIO 模式"],
             ["0x0F", "Write Multiple Coils", "批量设置数字输出"],
-            ["0x10", "Write Multiple Registers", "批量设置连续通道模式"],
+            ["0x10", "Write Multiple Registers", "批量设置模式或写单路完整 PWM 配置"],
         ],
         [1.0, 2.45, 3.55],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
@@ -466,7 +481,8 @@ def build() -> None:
         doc,
         "Modbus PDU 地址从 0 开始，传统线圈号和离散输入号从 1 开始显示。线圈返回最近写入的"
         "输出命令状态，离散输入返回引脚实际电平。GPIO35 到 GPIO37 的通道号始终保留，但默认"
-        "访问会返回非法数据地址异常。",
+        "访问会返回非法数据地址异常。PWM 模式读线圈仍返回最近的数字输出命令值；读离散输入"
+        "只得到采样瞬间电平，不能用来判断 PWM 占空比。模拟模式读离散输入返回异常 0x04。",
     )
     digital_rows = []
     for channel, gpio, note in DIGITAL_CHANNELS:
@@ -494,8 +510,8 @@ def build() -> None:
     add_body(
         doc,
         "模拟通道 0 到 17 依次对应 GPIO1 到 GPIO18。ADC 使用 12 dB 衰减和默认位宽。读取时会"
-        "把非输出 GPIO 切换为模拟模式。如果对应 GPIO 正在输出，固件返回异常 0x04，避免改变"
-        "现有输出。",
+        "把非输出 GPIO 切换为模拟模式。如果对应 GPIO 正在数字输出或 PWM 输出，固件返回异常"
+        " 0x04，保持现有输出；可先明确切换到模拟模式再读取 ADC。",
     )
     add_table(
         doc,
@@ -520,7 +536,8 @@ def build() -> None:
     add_body(
         doc,
         "PDU 地址 0x0000 到 0x0021 对应数字通道 0 到 33。可用 0x03 读取，用 0x06 或 0x10 写入。"
-        "写线圈会自动切换到输出模式；切换为其他模式会关闭输出驱动。",
+        "写线圈会停止 PWM 并切换到数字输出模式；PWM 通道切换为模式 0 到 4 时释放 PWM 资源。"
+        "切换到模式 3 时恢复最近一次线圈命令值。",
     )
     add_table(
         doc,
@@ -531,6 +548,7 @@ def build() -> None:
             [2, "下拉数字输入", "所有可用通道"],
             [3, "数字输出", "保留最近一次线圈命令值"],
             [4, "模拟输入", "仅数字通道 1 到 18"],
+            [5, "PWM 输出", "使用已保存配置；初始 1000 Hz、50%"],
         ],
         [1.0, 2.2, 3.8],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
@@ -546,22 +564,50 @@ def build() -> None:
         doc,
         ["PDU 地址", "传统寄存器号", "内容", "当前值"],
         [
-            ["0x0200", "40513", "协议版本", "0x0100 表示 1.0"],
-            ["0x0201", "40514", "固件版本", "0x0100 表示 1.0"],
+            ["0x0200", "40513", "协议版本", "0x0101 表示 1.1"],
+            ["0x0201", "40514", "固件版本", "0x0101 表示 1.1"],
             ["0x0202", "40515", "数字通道总数", "34"],
             ["0x0203", "40516", "模拟通道总数", "18"],
-            ["0x0204", "40517", "能力位", "bit0 ADC 校准；bit1 GPIO35 到 GPIO37"],
+            ["0x0204", "40517", "能力位", "bit0 ADC 校准；bit1 GPIO35 到 GPIO37；bit2 PWM"],
+            ["0x0205", "40518", "最大 PWM 输出数", "8"],
+            ["0x0206", "40519", "最大频率种类", "4"],
         ],
         [1.0, 1.2, 1.8, 3.0],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.CENTER,
          WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
     )
 
+    add_body(doc, "前 5 个信息寄存器保持兼容。先读 0x0200 到 0x0204，确认 bit2 后再读取 PWM 扩展。旧版 1.0 固件没有 PWM 扩展地址。")
+
+    doc.add_heading("7 4 PWM 配置", level=2)
+    add_body(doc, "数字通道 N 的 PWM 记录首地址为 0x0300 + 4 × N，每条记录占 4 个寄存器。整个配置区为 0x0300 到 0x0387，传统寄存器号为 40769 到 40904。通道 31 到 33 仍受 GPIO35 到 GPIO37 构建开关限制，禁用时返回 0x02。")
+    add_table(
+        doc,
+        ["偏移", "内容", "范围和含义"],
+        [
+            ["+0", "频率高 16 位", "与低字拼为 32 位无符号整数，单位 Hz"],
+            ["+1", "频率低 16 位", "合成频率为 10 到 100000 Hz"],
+            ["+2", "占空比", "0 到 10000；每单位 0.01%；5000 表示 50%"],
+            ["+3", "使能", "0 停止，1 启动；回读表示当前 PWM 状态"],
+        ],
+        [0.7, 1.6, 4.7],
+        [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
+    )
+    add_body(doc, "频率等于高字 × 65536 + 低字。1000 Hz 编码为 0x0000 0x03E8，100000 Hz 编码为 0x0001 0x86A0。每个寄存器内部高字节在前。读功能码 0x03 可读取单个字段或连续字段。")
+    add_body(doc, "写功能码 0x10 必须从记录首地址开始，数量为 4、字节数为 8，一次提交频率、占空比和使能。禁止部分写或跨记录写；0x06 写 PWM 配置返回 0x03。参数超范围、使能不是 0 或 1 时，也返回 0x03。")
+    add_body(doc, "使能为 1 时应用参数并进入模式 5。使能为 0 时保存参数；若通道原来为 PWM，则停止并切换为浮空输入，其他模式保持原样。停止后的参数可再次通过模式 5 启动。参数只保存在内存中，重启后 GPIO 恢复浮空输入，PWM 全部关闭，各通道 PWM 配置恢复为 1000 Hz、50%。")
+
+    doc.add_heading("7 5 PWM 资源和精度", level=2)
+    add_body(doc, "LEDC 硬件最多同时输出 8 路、使用 4 种频率。同频通道共享定时器，占空比独立。修改其中一路的占空比不会修改其他通道；不同频率需要另一只定时器。资源不足返回 0x06，资源检查阶段保持原有输出。可使用已有频率，或先停止不再使用的输出以释放资源。")
+    add_body(doc, "时钟源为 40 MHz XTAL，驱动按频率选择 8 到 14 位计数分辨率。0.01% 是协议输入步进，实际占空比会量化到硬件刻度；频率越高，可用分辨率越低。实际频率也有分频量化误差。回读返回请求参数，不是波形测量值。0% 常低、100% 常高，两者仍占用 PWM 资源。")
+    add_body(doc, "PWM 是 3.3 V 数字脉冲，不是 DAC 模拟电压。外部电路需要平滑电压时应按负载设计滤波和缓冲；需要精确频率、占空比或切换时序时，应在目标板上用示波器核验。")
+
     doc.add_heading("8 请求与响应规则", level=1)
     add_body(doc, "功能码 0x01 和 0x02 的位从响应数据字节最低位开始排列，未使用的最高位填 0。")
     add_body(doc, "功能码 0x05 使用 0xFF00 表示高电平，使用 0x0000 表示低电平。其他值返回异常 0x03。")
-    add_body(doc, "功能码 0x03 和 0x04 的寄存器按高字节在前排列。0x06 只允许写 GPIO 模式地址。")
-    add_body(doc, "功能码 0x0F 按最低位优先携带线圈值。0x10 的每个模式占 2 字节。固件先验证完整请求，再执行批量写。")
+    add_body(doc, "功能码 0x03 和 0x04 的寄存器按高字节在前排列。0x06 只允许写 GPIO 模式地址，包括模式 5；写 PWM 配置返回 0x03。")
+    add_body(doc, "功能码 0x0F 按最低位优先携带线圈值。0x10 的每个寄存器占 2 字节。固件先验证完整请求，再执行批量写。成功响应回显起始地址和数量。")
+    add_body(doc, "GPIO 模式区的 0x10 写入只要包含模式 5，数量就必须为 1；多通道模式请求含模式 5 时，整条返回 0x03，不会部分启动。模式 0 到 4 仍可批量写。PWM 配置区的 0x10 只接受单条对齐的完整 4 寄存器记录。需要启动多路 PWM 时逐路配置并检查响应。")
 
     doc.add_heading("9 异常响应", level=1)
     add_table(
@@ -570,8 +616,9 @@ def build() -> None:
         [
             ["0x01", "Illegal Function", "不支持该功能码"],
             ["0x02", "Illegal Data Address", "地址越界、通道禁用或能力不匹配"],
-            ["0x03", "Illegal Data Value", "数量、字节数、线圈编码或模式值无效"],
-            ["0x04", "Server Device Failure", "模式冲突或底层 GPIO ADC 操作失败"],
+            ["0x03", "Illegal Data Value", "数量、字节数、线圈、模式或 PWM 参数和格式无效"],
+            ["0x04", "Server Device Failure", "模式冲突或底层 GPIO ADC PWM 操作失败"],
+            ["0x06", "Server Device Busy", "PWM 通道或定时器资源不足"],
         ],
         [1.0, 2.1, 3.9],
         [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.LEFT],
@@ -587,6 +634,9 @@ def build() -> None:
         ("把数字通道 1 对应的 GPIO1 输出高电平", ["请求  01 05 00 01 FF 00 DD FA", "响应  01 05 00 01 FF 00 DD FA"]),
         ("读取模拟通道 0 的原始值", ["请求  01 04 00 00 00 01 31 CA", "响应  01 04 02 RAW_H RAW_L CRC_LO CRC_HI"]),
         ("读取模拟通道 0 的校准毫伏值", ["请求  01 04 01 00 00 01 30 36", "响应  01 04 02 MV_H MV_L CRC_LO CRC_HI"]),
+        ("通道 1 GPIO1 设置 1000 Hz、50% 并启动 PWM", ["请求  01 10 03 04 00 04 08 00 00 03 E8 13 88 00 01 67 3C", "响应  01 10 03 04 00 04 80 4F"]),
+        ("读取通道 1 PWM 配置，响应对应上例启动后的状态", ["请求  01 03 03 04 00 04 05 8C", "响应  01 03 08 00 00 03 E8 13 88 00 01 B0 9D"]),
+        ("停止通道 1 PWM，恢复浮空输入并保留参数", ["请求  01 10 03 04 00 04 08 00 00 03 E8 13 88 00 00 A6 FC", "响应  01 10 03 04 00 04 80 4F"]),
     ]
     for label, lines in examples:
         add_body(doc, "", bold_lead=label)
@@ -605,8 +655,14 @@ def build() -> None:
             "python tools/modbus_usb_client.py --port COM8 read-analog 0 4",
             "python tools/modbus_usb_client.py --port COM8 read-analog 0 4 --raw",
             "python tools/modbus_usb_client.py --port COM8 set-mode 1 0",
+            "python tools/modbus_usb_client.py --port COM8 pwm-set 1 1000 50",
+            "python tools/modbus_usb_client.py --port COM8 pwm-read 1",
+            "python tools/modbus_usb_client.py --port COM8 pwm-stop 1",
+            "python tools/modbus_usb_client.py --port COM8 pwm-set 1 1000 25 --disabled",
         ],
     )
+    add_body(doc, "pwm-set 参数依次为数字通道号、整数频率 Hz、占空比百分数，支持如 12.34 的占空比。默认启动；--disabled 保存配置但不启动，并停止当前通道已有 PWM。pwm-read 回读配置和使能，pwm-stop 停止并保留参数。")
+    add_body(doc, "图形上位机 tools/modbus_usb_gui.py 的 PWM 页面提供通道选择、频率 Hz、占空比 %、应用并启动、停止和回读。连接旧版 1.0 固件时，数字 IO 和 ADC 仍可使用，PWM 控件按能力位禁用。")
 
     doc.add_heading("12 构建配置", level=1)
     add_body(
@@ -623,6 +679,7 @@ def build() -> None:
     references = [
         ("ESP-IDF USB Device Stack", "https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/usb_device.html"),
         ("ESP-IDF ADC Oneshot Driver", "https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/adc_oneshot.html"),
+        ("ESP-IDF LEDC Driver", "https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/ledc.html"),
         ("ESP32-S3 Datasheet", "https://documentation.espressif.com/esp32_s3_datasheet_en.pdf"),
         ("Modbus Application Protocol V1.1b3", "https://www.modbus.org/docs/Modbus_Application_Protocol_V1_1b3.pdf"),
         ("Modbus Serial Line Guide V1.02", "https://www.modbus.org/docs/Modbus_over_serial_line_V1_02.pdf"),
@@ -639,4 +696,7 @@ def build() -> None:
 
 
 if __name__ == "__main__":
-    build()
+    parser = argparse.ArgumentParser(description="Build the ESP32-S3 Modbus IO protocol DOCX")
+    parser.add_argument("--board-image", type=Path, default=BOARD_IMAGE, help="Development board pinout image")
+    args = parser.parse_args()
+    build(args.board_image)

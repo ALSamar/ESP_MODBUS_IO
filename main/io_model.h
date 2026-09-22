@@ -13,6 +13,11 @@ extern "C" {
 #define IO_SAFE_DIGITAL_CHANNEL_COUNT 31U
 #define IO_ANALOG_CHANNEL_COUNT 18U
 #define IO_ANALOG_MV_UNAVAILABLE UINT16_MAX
+#define IO_PWM_MIN_FREQUENCY_HZ 10U
+#define IO_PWM_MAX_FREQUENCY_HZ 100000U
+#define IO_PWM_DUTY_MAX 10000U
+#define IO_PWM_MAX_CHANNELS 8U
+#define IO_PWM_MAX_TIMERS 4U
 
 typedef enum {
     IO_MODE_INPUT_FLOATING = 0,
@@ -20,6 +25,7 @@ typedef enum {
     IO_MODE_INPUT_PULLDOWN = 2,
     IO_MODE_OUTPUT = 3,
     IO_MODE_ANALOG = 4,
+    IO_MODE_PWM = 5,
 } io_mode_t;
 
 esp_err_t io_model_init(void);
@@ -34,6 +40,12 @@ esp_err_t io_model_read_digital(uint16_t channel, bool *level);
 esp_err_t io_model_get_mode(uint16_t channel, uint16_t *mode);
 esp_err_t io_model_validate_mode(uint16_t channel, uint16_t mode);
 esp_err_t io_model_set_mode(uint16_t channel, uint16_t mode);
+
+/* Duty is in basis points: 0..10000 represents 0..100%. Settings are volatile. */
+esp_err_t io_model_pwm_configure(uint16_t channel, uint32_t frequency_hz,
+                                 uint16_t duty_bp, bool enabled);
+esp_err_t io_model_pwm_get(uint16_t channel, uint32_t *frequency_hz,
+                           uint16_t *duty_bp, bool *enabled);
 
 esp_err_t io_model_read_analog_raw(uint16_t channel, uint16_t *raw);
 esp_err_t io_model_read_analog_mv(uint16_t channel, uint16_t *millivolts);

@@ -1,0 +1,2 @@
+#pragma once
+#define CONFIG_USB_MODBUS_ENABLE_GPIO35_37 0

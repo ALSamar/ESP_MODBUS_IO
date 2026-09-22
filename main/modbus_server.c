@@ -22,17 +22,20 @@ enum {
     EX_ILLEGAL_DATA_ADDRESS = 0x02,
     EX_ILLEGAL_DATA_VALUE = 0x03,
     EX_SERVER_DEVICE_FAILURE = 0x04,
+    EX_SERVER_DEVICE_BUSY = 0x06,
 };
 
 enum {
     HR_MODE_BASE = 0x0000,
     HR_GPIO_MAP_BASE = 0x0100,
     HR_INFO_BASE = 0x0200,
-    HR_INFO_COUNT = 5,
+    HR_INFO_COUNT = 7,
+    HR_PWM_BASE = 0x0300,
+    HR_PWM_STRIDE = 4,
     IR_RAW_BASE = 0x0000,
     IR_MV_BASE = 0x0100,
-    PROTOCOL_VERSION = 0x0100,
-    FIRMWARE_VERSION = 0x0100,
+    PROTOCOL_VERSION = 0x0101,
+    FIRMWARE_VERSION = 0x0101,
 };
 
 static uint16_t read_be16(const uint8_t *data)
@@ -117,6 +120,9 @@ static esp_err_t make_exception(uint8_t slave, uint8_t function, uint8_t excepti
 
 static uint8_t exception_for_error(esp_err_t error)
 {
+    if (error == ESP_ERR_NOT_FOUND) {
+        return EX_SERVER_DEVICE_BUSY;
+    }
     if (error == ESP_ERR_INVALID_ARG || error == ESP_ERR_NOT_SUPPORTED) {
         return EX_ILLEGAL_DATA_ADDRESS;
     }
@@ -202,7 +208,7 @@ static esp_err_t read_holding_register(uint16_t address, uint16_t *value)
             *value = IO_ANALOG_CHANNEL_COUNT;
             break;
         case 4:
-            *value = (uint16_t)((io_model_calibration_supported() ? 1U : 0U) |
+            *value = (uint16_t)(4U | (io_model_calibration_supported() ? 1U : 0U) |
 #if CONFIG_USB_MODBUS_ENABLE_GPIO35_37
                                 2U
 #else
@@ -210,8 +216,33 @@ static esp_err_t read_holding_register(uint16_t address, uint16_t *value)
 #endif
             );
             break;
+        case 5:
+            *value = IO_PWM_MAX_CHANNELS;
+            break;
+        case 6:
+            *value = IO_PWM_MAX_TIMERS;
+            break;
         default:
             return ESP_ERR_INVALID_ARG;
+        }
+        return ESP_OK;
+    }
+    if ((address >= HR_PWM_BASE) &&
+        (address < HR_PWM_BASE + HR_PWM_STRIDE * IO_DIGITAL_CHANNEL_COUNT)) {
+        const uint16_t channel = (address - HR_PWM_BASE) / HR_PWM_STRIDE;
+        const uint16_t field = (address - HR_PWM_BASE) % HR_PWM_STRIDE;
+        uint32_t frequency = 0;
+        uint16_t duty = 0;
+        bool enabled = false;
+        const esp_err_t error = io_model_pwm_get(channel, &frequency, &duty, &enabled);
+        if (error != ESP_OK) {
+            return error;
+        }
+        switch (field) {
+        case 0: *value = (uint16_t)(frequency >> 16); break;
+        case 1: *value = (uint16_t)frequency; break;
+        case 2: *value = duty; break;
+        case 3: *value = enabled ? 1U : 0U; break;
         }
         return ESP_OK;
     }
@@ -227,6 +258,10 @@ static esp_err_t read_registers(uint8_t function, uint16_t start, uint16_t quant
                               response, capacity, response_length);
     }
 
+    if ((uint32_t)start + quantity > 0x10000UL) {
+        return make_exception(slave, function, EX_ILLEGAL_DATA_ADDRESS,
+                              response, capacity, response_length);
+    }
     const size_t byte_count = (size_t)quantity * 2U;
     if (capacity < byte_count + 5U) {
         return ESP_ERR_NO_MEM;
@@ -301,6 +336,15 @@ static esp_err_t write_single_register(const uint8_t *request, bool broadcast,
 {
     const uint16_t address = read_be16(&request[2]);
     const uint16_t value = read_be16(&request[4]);
+    if ((address >= HR_PWM_BASE) &&
+        (address < HR_PWM_BASE + HR_PWM_STRIDE * IO_DIGITAL_CHANNEL_COUNT)) {
+        if (broadcast) {
+            return ESP_OK;
+        }
+        /* A frequency, duty and enable flag must be sent as one record. */
+        return make_exception(request[0], request[1], EX_ILLEGAL_DATA_VALUE,
+                              response, capacity, response_length);
+    }
     esp_err_t error = ESP_ERR_INVALID_ARG;
     if (address < IO_DIGITAL_CHANNEL_COUNT) {
         error = io_model_validate_mode(address, value);
@@ -313,7 +357,7 @@ static esp_err_t write_single_register(const uint8_t *request, bool broadcast,
         if (broadcast) {
             return ESP_OK;
         }
-        const uint8_t exception = (value > IO_MODE_ANALOG)
+        const uint8_t exception = (value > IO_MODE_PWM)
                                       ? EX_ILLEGAL_DATA_VALUE
                                       : exception_for_error(error);
         return make_exception(request[0], request[1], exception,
@@ -402,6 +446,47 @@ static esp_err_t write_multiple_registers(const uint8_t *request, size_t request
         return make_exception(request[0], request[1], EX_ILLEGAL_DATA_VALUE,
                               response, capacity, response_length);
     }
+    if ((start >= HR_PWM_BASE) &&
+        (start < HR_PWM_BASE + HR_PWM_STRIDE * IO_DIGITAL_CHANNEL_COUNT)) {
+        uint8_t exception = 0U;
+        const uint16_t channel = (start - HR_PWM_BASE) / HR_PWM_STRIDE;
+        if (((start - HR_PWM_BASE) % HR_PWM_STRIDE != 0U) ||
+            (quantity != HR_PWM_STRIDE)) {
+            exception = EX_ILLEGAL_DATA_VALUE;
+        } else if (!io_model_channel_available(channel)) {
+            exception = EX_ILLEGAL_DATA_ADDRESS;
+        } else {
+            const uint32_t frequency = ((uint32_t)read_be16(&request[7]) << 16) |
+                                       read_be16(&request[9]);
+            const uint16_t duty = read_be16(&request[11]);
+            const uint16_t enabled = read_be16(&request[13]);
+            if ((frequency < IO_PWM_MIN_FREQUENCY_HZ) ||
+                (frequency > IO_PWM_MAX_FREQUENCY_HZ) ||
+                (duty > IO_PWM_DUTY_MAX) || (enabled > 1U)) {
+                exception = EX_ILLEGAL_DATA_VALUE;
+            } else {
+                const esp_err_t error = io_model_pwm_configure(channel, frequency,
+                                                               duty, enabled != 0U);
+                if (error != ESP_OK) {
+                    exception = exception_for_error(error);
+                }
+            }
+        }
+        if (broadcast) {
+            return ESP_OK;
+        }
+        if (exception != 0U) {
+            return make_exception(request[0], request[1], exception,
+                                  response, capacity, response_length);
+        }
+        if (capacity < 8U) {
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(response, request, 6U);
+        append_crc(response, 6U);
+        *response_length = 8U;
+        return ESP_OK;
+    }
     if (((uint32_t)start + quantity) > IO_DIGITAL_CHANNEL_COUNT) {
         if (broadcast) {
             return ESP_OK;
@@ -412,12 +497,20 @@ static esp_err_t write_multiple_registers(const uint8_t *request, size_t request
 
     for (uint16_t offset = 0; offset < quantity; ++offset) {
         const uint16_t value = read_be16(&request[7U + ((size_t)offset * 2U)]);
+        /* Enable PWM one channel at a time: shared resources may be exhausted. */
+        if ((value == IO_MODE_PWM) && (quantity != 1U)) {
+            if (broadcast) {
+                return ESP_OK;
+            }
+            return make_exception(request[0], request[1], EX_ILLEGAL_DATA_VALUE,
+                                  response, capacity, response_length);
+        }
         const esp_err_t error = io_model_validate_mode(start + offset, value);
         if (error != ESP_OK) {
             if (broadcast) {
                 return ESP_OK;
             }
-            const uint8_t exception = (value > IO_MODE_ANALOG)
+            const uint8_t exception = (value > IO_MODE_PWM)
                                           ? EX_ILLEGAL_DATA_VALUE
                                           : exception_for_error(error);
             return make_exception(request[0], request[1], exception,
@@ -432,7 +525,7 @@ static esp_err_t write_multiple_registers(const uint8_t *request, size_t request
             if (broadcast) {
                 return ESP_OK;
             }
-            return make_exception(request[0], request[1], EX_SERVER_DEVICE_FAILURE,
+            return make_exception(request[0], request[1], exception_for_error(error),
                                   response, capacity, response_length);
         }
     }
@@ -459,6 +552,12 @@ esp_err_t modbus_server_process(const uint8_t *request, size_t request_length,
     *response_length = 0U;
     if (!modbus_rtu_crc_valid(request, request_length)) {
         return ESP_ERR_INVALID_CRC;
+    }
+    /* Validate length before handlers read function-specific fields. */
+    const size_t expected = modbus_server_expected_request_length(request, request_length);
+    if ((request_length > MODBUS_RTU_MAX_ADU_SIZE) ||
+        (expected == 0U) || (expected == SIZE_MAX) || (expected != request_length)) {
+        return ESP_ERR_INVALID_SIZE;
     }
 
     const bool broadcast = request[0] == 0U;

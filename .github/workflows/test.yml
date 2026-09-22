@@ -1,0 +1,17 @@
+name: IO regression tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  protocol-and-pwm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CC: gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test Python clients and production C protocol and PWM logic
+        run: python -m unittest discover -s tests -v

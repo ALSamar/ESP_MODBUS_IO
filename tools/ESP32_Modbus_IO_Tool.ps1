@@ -10,7 +10,10 @@ Add-Type -AssemblyName System.Drawing
 
 $script:SlaveAddress = 1
 $script:TimeoutMs = 700
-$script:ModeNames = @("浮空输入", "上拉输入", "下拉输入", "数字输出", "模拟输入")
+$script:ModeNames = @("浮空输入", "上拉输入", "下拉输入", "数字输出", "模拟输入", "PWM 输出")
+$script:DigitalCount = 31
+$script:AnalogCount = 18
+$script:PwmSupported = $false
 $script:DigitalGpios = @(0..18) + @(21, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48)
 $script:AnalogGpios = @(1..18)
 
@@ -108,7 +111,9 @@ function Invoke-Modbus {
     [byte[]]$body = $bytes[0..($bytes.Length - 3)]
     if ((Get-ModbusCrc $body) -ne $receivedCrc) { throw "响应 CRC 校验失败" }
     if ($bytes[0] -ne $script:SlaveAddress) { throw "从站地址不匹配" }
+    if ($bytes[1] -notin @($Request[1], ($Request[1] -bor 0x80))) { throw "响应功能码不匹配" }
     if (($bytes[1] -band 0x80) -ne 0) {
+        if ($bytes[2] -eq 6) { throw "PWM 资源不足：最多 8 路输出、4 种频率" }
         throw "Modbus 异常 0x$('{0:X2}' -f $bytes[2])"
     }
     return ,$bytes
@@ -117,6 +122,7 @@ function Invoke-Modbus {
 function Read-ModbusRegisters {
     param([byte]$Function, [uint16]$Start, [uint16]$Count)
     [byte[]]$response = Invoke-Modbus (New-ModbusRequest $Function $Start $Count)
+    if ($response[2] -ne (2 * $Count)) { throw "寄存器响应数量不匹配" }
     $values = New-Object 'System.Collections.Generic.List[uint16]'
     for ($offset = 0; $offset -lt $response[2]; $offset += 2) {
         $values.Add([uint16](($response[3 + $offset] -shl 8) -bor $response[4 + $offset]))
@@ -127,6 +133,7 @@ function Read-ModbusRegisters {
 function Read-ModbusBits {
     param([byte]$Function, [uint16]$Start, [uint16]$Count)
     [byte[]]$response = Invoke-Modbus (New-ModbusRequest $Function $Start $Count)
+    if ($response[2] -ne [math]::Ceiling($Count / 8.0)) { throw "位响应数量不匹配" }
     $values = New-Object 'System.Collections.Generic.List[bool]'
     for ($index = 0; $index -lt $Count; $index++) {
         $values.Add((($response[3 + [math]::Floor($index / 8)] -shr ($index % 8)) -band 1) -ne 0)
@@ -168,6 +175,7 @@ function Invoke-UiAction {
     $script:Form.UseWaitCursor = $true
     [System.Windows.Forms.Application]::DoEvents()
     try {
+        $script:SlaveAddress = [int]$script:SlaveBox.Value
         & $Action
         $script:StatusLabel.Text = "已连接 · $([string]$script:PortBox.SelectedItem) · 从站 $script:SlaveAddress"
         $script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(26, 125, 80)
@@ -204,41 +212,94 @@ function Refresh-PortList {
 function Read-DeviceInfo {
     $script:SlaveAddress = [int]$script:SlaveBox.Value
     [uint16[]]$info = Read-ModbusRegisters 3 0x0200 5
+    $script:DigitalCount = if (($info[4] -band 2) -ne 0) { [int]$info[2] } else { [math]::Min([int]$info[2], 31) }
+    $script:AnalogCount = [int]$info[3]
+    $script:ChannelBox.Maximum = $script:DigitalCount - 1
+    $script:PwmChannelBox.Maximum = $script:DigitalCount - 1
+    $script:PwmSupported = ($info[4] -band 4) -ne 0
+    $script:PwmApply.Enabled = $script:PwmSupported
+    $script:PwmStop.Enabled = $script:PwmSupported
+    $script:PwmRefresh.Enabled = $script:PwmSupported
+    if ($script:PwmSupported) {
+        [uint16[]]$limits = Read-ModbusRegisters 3 0x0205 2
+        $script:PwmHint.Text = "10～100000 Hz；占空比 0～100%，步进 0.01%。最多 $($limits[0]) 路、$($limits[1]) 种频率；同频率共享定时器。表中显示设定值，实际波形受硬件量化。参数断电复位，停止后恢复浮空输入。"
+    } else {
+        $script:PwmHint.Text = "当前固件不支持 PWM，请更新到协议 1.1；数字 IO 和 ADC 仍可使用。"
+    }
     $script:ProtocolValue.Text = "$($info[0] -shr 8).$($info[0] -band 0xFF)"
     $script:FirmwareValue.Text = "$($info[1] -shr 8).$($info[1] -band 0xFF)"
-    $script:DigitalValue.Text = [string]$info[2]
+    $script:DigitalValue.Text = "$script:DigitalCount / $($info[2])"
     $script:AnalogValue.Text = [string]$info[3]
     $script:CalibrationValue.Text = if (($info[4] -band 1) -ne 0) { "可用" } else { "不可用" }
     $script:ReservedValue.Text = if (($info[4] -band 2) -ne 0) { "已启用" } else { "安全禁用" }
 }
 
 function Refresh-DigitalTable {
-    $script:SlaveAddress = [int]$script:SlaveBox.Value
-    [uint16[]]$modes = Read-ModbusRegisters 3 0 31
-    [uint16[]]$mapping = Read-ModbusRegisters 3 0x0100 31
-    [bool[]]$outputs = Read-ModbusBits 1 0 31
+    Read-DeviceInfo
+    [uint16[]]$modes = Read-ModbusRegisters 3 0 $script:DigitalCount
+    [uint16[]]$mapping = Read-ModbusRegisters 3 0x0100 $script:DigitalCount
+    [bool[]]$outputs = Read-ModbusBits 1 0 $script:DigitalCount
     $script:DigitalGrid.Rows.Clear()
 
-    for ($channel = 0; $channel -lt 31; $channel++) {
+    for ($channel = 0; $channel -lt $script:DigitalCount; $channel++) {
         $inputText = "—"
-        if ($modes[$channel] -ne 4) {
+        if ($modes[$channel] -notin @(4, 5)) {
             [bool[]]$inputValue = Read-ModbusBits 2 $channel 1
             $inputText = if ($inputValue[0]) { "高" } else { "低" }
         }
         $modeText = if ($modes[$channel] -lt $script:ModeNames.Count) { $script:ModeNames[$modes[$channel]] } else { "未知" }
-        $outputText = if ($outputs[$channel]) { "高" } else { "低" }
+        $outputText = if ($modes[$channel] -eq 5) { "PWM" } elseif ($modes[$channel] -ne 3) { "—" } elseif ($outputs[$channel]) { "高" } else { "低" }
         [void]$script:DigitalGrid.Rows.Add($channel, "GPIO$($mapping[$channel])", $modeText, $inputText, $outputText)
     }
 }
 
 function Refresh-AnalogTable {
-    $script:SlaveAddress = [int]$script:SlaveBox.Value
-    [uint16[]]$raw = Read-ModbusRegisters 4 0x0000 18
-    [uint16[]]$millivolts = Read-ModbusRegisters 4 0x0100 18
+    Read-DeviceInfo
+    [uint16[]]$modes = Read-ModbusRegisters 3 1 $script:AnalogCount
     $script:AnalogGrid.Rows.Clear()
-    for ($channel = 0; $channel -lt 18; $channel++) {
-        $mvText = if ($millivolts[$channel] -eq 0xFFFF) { "不可用" } else { "$($millivolts[$channel]) mV" }
-        [void]$script:AnalogGrid.Rows.Add($channel, "GPIO$($script:AnalogGpios[$channel])", $raw[$channel], $mvText)
+    for ($channel = 0; $channel -lt $script:AnalogCount; $channel++) {
+        if ($modes[$channel] -in @(3, 5)) {
+            $state = if ($modes[$channel] -eq 5) { "PWM 输出占用" } else { "数字输出占用" }
+            [void]$script:AnalogGrid.Rows.Add($channel, "GPIO$($script:AnalogGpios[$channel])", $state, "—")
+            continue
+        }
+        [uint16[]]$raw = Read-ModbusRegisters 4 $channel 1
+        [uint16[]]$millivolts = Read-ModbusRegisters 4 (0x0100 + $channel) 1
+        $mvText = if ($millivolts[0] -eq 0xFFFF) { "不可用" } else { "$($millivolts[0]) mV" }
+        [void]$script:AnalogGrid.Rows.Add($channel, "GPIO$($script:AnalogGpios[$channel])", $raw[0], $mvText)
+    }
+}
+
+function Read-PwmConfig {
+    param([uint16]$Channel)
+    [uint16[]]$values = Read-ModbusRegisters 3 (0x0300 + 4 * $Channel) 4
+    [uint32]$frequency = ([uint32]$values[0] -shl 16) -bor [uint32]$values[1]
+    if ($frequency -lt 10 -or $frequency -gt 100000 -or $values[2] -gt 10000 -or $values[3] -gt 1) { throw "设备 PWM 参数无效" }
+    return @{ Frequency = $frequency; Duty = ([decimal]$values[2] / 100); Enabled = ($values[3] -eq 1) }
+}
+
+function Write-PwmConfig {
+    param([uint16]$Channel, [uint32]$Frequency, [decimal]$Duty, [bool]$Enabled)
+    if ($Channel -ge $script:DigitalCount) { throw "通道不可用" }
+    if ($Frequency -lt 10 -or $Frequency -gt 100000 -or $Duty -lt 0 -or $Duty -gt 100 -or ($Duty * 100) -ne [decimal]::Truncate($Duty * 100)) { throw "PWM 频率或占空比超出范围" }
+    [uint16[]]$values = @([uint16]($Frequency -shr 16), [uint16]($Frequency -band 0xFFFF), [uint16]($Duty * 100), [uint16]$Enabled)
+    [byte[]]$echo = New-ModbusRequest 16 (0x0300 + 4 * $Channel) 4
+    [byte[]]$payload = $echo[0..5] + @([byte]8)
+    foreach ($value in $values) { $payload += @([byte]($value -shr 8), [byte]($value -band 0xFF)) }
+    [uint16]$crc = Get-ModbusCrc $payload
+    [byte[]]$response = Invoke-Modbus ($payload + @([byte]($crc -band 0xFF), [byte]($crc -shr 8)))
+    if ([BitConverter]::ToString($response) -ne [BitConverter]::ToString($echo)) { throw "PWM 写入回显不匹配" }
+}
+
+function Refresh-PwmTable {
+    Read-DeviceInfo
+    if (-not $script:PwmSupported) { throw "当前固件不支持 PWM" }
+    [uint16[]]$mapping = Read-ModbusRegisters 3 0x0100 $script:DigitalCount
+    $script:PwmGrid.Rows.Clear()
+    for ($channel = 0; $channel -lt $script:DigitalCount; $channel++) {
+        $config = Read-PwmConfig $channel
+        $state = if ($config.Enabled) { "运行中" } else { "未启用" }
+        [void]$script:PwmGrid.Rows.Add($channel, "GPIO$($mapping[$channel])", $config.Frequency, $config.Duty.ToString('F2'), $state)
     }
 }
 
@@ -478,7 +539,7 @@ $refreshAnalogButton.Size = New-Object System.Drawing.Size(130, 32)
 $analogToolbar.Controls.Add($refreshAnalogButton)
 
 $analogHint = New-Object System.Windows.Forms.Label
-$analogHint.Text = "读取将自动把 GPIO1–18 切换到模拟输入模式"
+$analogHint.Text = "读取可用 ADC；保留数字输出和 PWM 通道"
 $analogHint.Location = New-Object System.Drawing.Point(170, 22)
 $analogHint.AutoSize = $true
 $analogHint.ForeColor = [System.Drawing.Color]::FromArgb(95, 105, 120)
@@ -499,6 +560,82 @@ $script:AnalogGrid.BackgroundColor = [System.Drawing.Color]::White
 [void]$script:AnalogGrid.Columns.Add("mv", "校准电压")
 $analogTab.Controls.Add($script:AnalogGrid)
 $script:AnalogGrid.BringToFront()
+
+$pwmTab = New-Object System.Windows.Forms.TabPage
+$pwmTab.Text = "PWM 输出"
+$pwmTab.BackColor = [System.Drawing.Color]::White
+$tabs.TabPages.Add($pwmTab)
+
+$pwmToolbar = New-Object System.Windows.Forms.FlowLayoutPanel
+$pwmToolbar.Dock = [System.Windows.Forms.DockStyle]::Top
+$pwmToolbar.Height = 92
+$pwmToolbar.Padding = New-Object System.Windows.Forms.Padding(12)
+$pwmToolbar.WrapContents = $true
+$pwmTab.Controls.Add($pwmToolbar)
+
+$script:PwmChannelBox = New-Object System.Windows.Forms.NumericUpDown
+$script:PwmChannelBox.Maximum = 30
+$script:PwmChannelBox.Width = 65
+$script:PwmFrequencyBox = New-Object System.Windows.Forms.NumericUpDown
+$script:PwmFrequencyBox.Minimum = 10
+$script:PwmFrequencyBox.Maximum = 100000
+$script:PwmFrequencyBox.Value = 1000
+$script:PwmFrequencyBox.Width = 110
+$script:PwmDutyBox = New-Object System.Windows.Forms.NumericUpDown
+$script:PwmDutyBox.Minimum = 0
+$script:PwmDutyBox.Maximum = 100
+$script:PwmDutyBox.DecimalPlaces = 2
+$script:PwmDutyBox.Increment = [decimal]0.01
+$script:PwmDutyBox.Value = 50
+$script:PwmDutyBox.Width = 95
+foreach ($pair in @(@("通道", $script:PwmChannelBox), @("频率 / Hz", $script:PwmFrequencyBox), @("占空比 / %", $script:PwmDutyBox))) {
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $pair[0]
+    $label.AutoSize = $true
+    $label.Margin = New-Object System.Windows.Forms.Padding(5, 6, 3, 3)
+    $pwmToolbar.Controls.Add($label)
+    $pwmToolbar.Controls.Add($pair[1])
+}
+$script:PwmEnableBox = New-Object System.Windows.Forms.CheckBox
+$script:PwmEnableBox.Text = "启用输出"
+$script:PwmEnableBox.Checked = $true
+$script:PwmEnableBox.AutoSize = $true
+$pwmToolbar.Controls.Add($script:PwmEnableBox)
+
+$script:PwmApply = New-Object System.Windows.Forms.Button
+$script:PwmApply.Text = "应用参数"
+$script:PwmStop = New-Object System.Windows.Forms.Button
+$script:PwmStop.Text = "停止所选通道"
+$script:PwmRefresh = New-Object System.Windows.Forms.Button
+$script:PwmRefresh.Text = "读取 PWM 状态"
+foreach ($button in @($script:PwmApply, $script:PwmStop, $script:PwmRefresh)) {
+    $button.Size = New-Object System.Drawing.Size(112, 30)
+    $button.Enabled = $false
+    $pwmToolbar.Controls.Add($button)
+}
+
+$script:PwmHint = New-Object System.Windows.Forms.Label
+$script:PwmHint.Dock = [System.Windows.Forms.DockStyle]::Top
+$script:PwmHint.Height = 66
+$script:PwmHint.Padding = New-Object System.Windows.Forms.Padding(14, 8, 14, 8)
+$script:PwmHint.Text = "连接设备后可配置 PWM。点击表格行可载入对应通道的参数。"
+$pwmTab.Controls.Add($script:PwmHint)
+$script:PwmHint.BringToFront()
+
+$script:PwmGrid = New-Object System.Windows.Forms.DataGridView
+$script:PwmGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:PwmGrid.AllowUserToAddRows = $false
+$script:PwmGrid.AllowUserToDeleteRows = $false
+$script:PwmGrid.ReadOnly = $true
+$script:PwmGrid.RowHeadersVisible = $false
+$script:PwmGrid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+$script:PwmGrid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+$script:PwmGrid.BackgroundColor = [System.Drawing.Color]::White
+foreach ($column in @(@("channel", "通道"), @("gpio", "GPIO"), @("frequency", "设置频率 / Hz"), @("duty", "设置占空比 / %"), @("enabled", "输出状态"))) {
+    [void]$script:PwmGrid.Columns.Add($column[0], $column[1])
+}
+$pwmTab.Controls.Add($script:PwmGrid)
+$script:PwmGrid.BringToFront()
 
 $logTab = New-Object System.Windows.Forms.TabPage
 $logTab.Text = "运行日志"
@@ -521,6 +658,8 @@ $refreshAnalogButton.Add_Click({ Invoke-UiAction "读取全部 ADC" { Refresh-An
 
 $setModeButton.Add_Click({
     Invoke-UiAction "设置通道模式" {
+        Read-DeviceInfo
+        if ($script:ModeBox.SelectedIndex -eq 5 -and -not $script:PwmSupported) { throw "当前固件不支持 PWM" }
         Write-ModbusRegister ([uint16]$script:ChannelBox.Value) ([uint16]$script:ModeBox.SelectedIndex)
         Refresh-DigitalTable
     }
@@ -537,6 +676,36 @@ $lowButton.Add_Click({
     Invoke-UiAction "输出低电平" {
         Write-ModbusCoil ([uint16]$script:ChannelBox.Value) $false
         Refresh-DigitalTable
+    }
+})
+
+$script:PwmApply.Add_Click({
+    Invoke-UiAction "配置 PWM" {
+        Read-DeviceInfo
+        if (-not $script:PwmSupported) { throw "当前固件不支持 PWM" }
+        Write-PwmConfig ([uint16]$script:PwmChannelBox.Value) ([uint32]$script:PwmFrequencyBox.Value) ([decimal]$script:PwmDutyBox.Value) $script:PwmEnableBox.Checked
+        Refresh-PwmTable
+    }
+})
+$script:PwmStop.Add_Click({
+    Invoke-UiAction "停止 PWM" {
+        Read-DeviceInfo
+        if (-not $script:PwmSupported) { throw "当前固件不支持 PWM" }
+        $config = Read-PwmConfig ([uint16]$script:PwmChannelBox.Value)
+        Write-PwmConfig ([uint16]$script:PwmChannelBox.Value) $config.Frequency $config.Duty $false
+        $script:PwmEnableBox.Checked = $false
+        Refresh-PwmTable
+    }
+})
+$script:PwmRefresh.Add_Click({ Invoke-UiAction "读取 PWM" { Refresh-PwmTable } })
+$script:PwmGrid.Add_CellClick({
+    param($sender, $eventArgs)
+    if ($eventArgs.RowIndex -ge 0) {
+        $row = $script:PwmGrid.Rows[$eventArgs.RowIndex]
+        $script:PwmChannelBox.Value = [int]$row.Cells[0].Value
+        $script:PwmFrequencyBox.Value = [decimal]$row.Cells[2].Value
+        $script:PwmDutyBox.Value = [decimal]$row.Cells[3].Value
+        $script:PwmEnableBox.Checked = $row.Cells[4].Value -eq "运行中"
     }
 })
 

@@ -8,6 +8,7 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
+#include "io_pwm.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "io_model";
@@ -29,6 +30,8 @@ static const gpio_num_t s_digital_gpio[IO_DIGITAL_CHANNEL_COUNT] = {
 
 static io_mode_t s_modes[IO_DIGITAL_CHANNEL_COUNT];
 static bool s_output_state[IO_DIGITAL_CHANNEL_COUNT];
+static uint32_t s_pwm_frequency[IO_DIGITAL_CHANNEL_COUNT];
+static uint16_t s_pwm_duty[IO_DIGITAL_CHANNEL_COUNT];
 
 static adc_oneshot_unit_handle_t s_adc_units[2];
 static adc_cali_handle_t s_adc_cali[IO_ANALOG_CHANNEL_COUNT];
@@ -118,6 +121,7 @@ static void init_calibration(uint16_t analog_channel)
 
 esp_err_t io_model_init(void)
 {
+    io_pwm_init();
     const adc_oneshot_unit_init_cfg_t adc1_cfg = {
         .unit_id = ADC_UNIT_1,
     };
@@ -133,6 +137,8 @@ esp_err_t io_model_init(void)
     for (uint16_t channel = 0; channel < IO_DIGITAL_CHANNEL_COUNT; ++channel) {
         s_modes[channel] = IO_MODE_INPUT_FLOATING;
         s_output_state[channel] = false;
+        s_pwm_frequency[channel] = 1000U;
+        s_pwm_duty[channel] = 5000U;
         if (io_model_channel_available(channel)) {
             ESP_RETURN_ON_ERROR(configure_gpio_mode(channel, IO_MODE_INPUT_FLOATING), TAG,
                                 "initialize digital channel %u", channel);
@@ -185,13 +191,19 @@ esp_err_t io_model_write_output(uint16_t channel, bool level)
         return ESP_ERR_INVALID_ARG;
     }
 
-    s_output_state[channel] = level;
     if (s_modes[channel] != IO_MODE_OUTPUT) {
-        ESP_RETURN_ON_ERROR(configure_gpio_mode(channel, IO_MODE_OUTPUT), TAG,
-                            "set channel %u to output", channel);
-        s_modes[channel] = IO_MODE_OUTPUT;
+        const bool previous_level = s_output_state[channel];
+        s_output_state[channel] = level;
+        const esp_err_t err = io_model_set_mode(channel, IO_MODE_OUTPUT);
+        if (err != ESP_OK) {
+            s_output_state[channel] = previous_level;
+        }
+        return err;
     }
-    return gpio_set_level(s_digital_gpio[channel], level);
+    ESP_RETURN_ON_ERROR(gpio_set_level(s_digital_gpio[channel], level), TAG,
+                        "set channel %u output level", channel);
+    s_output_state[channel] = level;
+    return ESP_OK;
 }
 
 esp_err_t io_model_read_digital(uint16_t channel, bool *level)
@@ -217,8 +229,12 @@ esp_err_t io_model_get_mode(uint16_t channel, uint16_t *mode)
 
 esp_err_t io_model_validate_mode(uint16_t channel, uint16_t mode)
 {
-    if (!io_model_channel_available(channel) || (mode > IO_MODE_ANALOG)) {
+    if (!io_model_channel_available(channel) || (mode > IO_MODE_PWM)) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if ((mode == IO_MODE_PWM || mode == IO_MODE_OUTPUT)
+        && !GPIO_IS_VALID_OUTPUT_GPIO(s_digital_gpio[channel])) {
+        return ESP_ERR_NOT_SUPPORTED;
     }
     if ((mode == IO_MODE_ANALOG) && (s_digital_gpio[channel] > GPIO_NUM_18)) {
         return ESP_ERR_NOT_SUPPORTED;
@@ -233,9 +249,66 @@ esp_err_t io_model_set_mode(uint16_t channel, uint16_t mode)
 {
     ESP_RETURN_ON_ERROR(io_model_validate_mode(channel, mode), TAG,
                         "validate mode %u for channel %u", mode, channel);
-    ESP_RETURN_ON_ERROR(configure_gpio_mode(channel, (io_mode_t)mode), TAG,
-                        "configure mode %u for channel %u", mode, channel);
+    if (mode == IO_MODE_PWM) {
+        return io_model_pwm_configure(channel, s_pwm_frequency[channel],
+                                       s_pwm_duty[channel], true);
+    }
+    const bool was_pwm = s_modes[channel] == IO_MODE_PWM;
+    if (was_pwm) {
+        ESP_RETURN_ON_ERROR(io_pwm_stop(channel), TAG, "stop PWM channel %u", channel);
+    }
+    const esp_err_t err = configure_gpio_mode(channel, (io_mode_t)mode);
+    if (err != ESP_OK) {
+        if (was_pwm) {
+            (void)io_pwm_start(channel, s_digital_gpio[channel], s_pwm_frequency[channel],
+                               s_pwm_duty[channel]);
+        }
+        return err;
+    }
     s_modes[channel] = (io_mode_t)mode;
+    return ESP_OK;
+}
+
+esp_err_t io_model_pwm_configure(uint16_t channel, uint32_t frequency_hz,
+                                 uint16_t duty_bp, bool enabled)
+{
+    if (!io_model_channel_available(channel)
+        || !GPIO_IS_VALID_OUTPUT_GPIO(s_digital_gpio[channel])
+        || frequency_hz < IO_PWM_MIN_FREQUENCY_HZ
+        || frequency_hz > IO_PWM_MAX_FREQUENCY_HZ || duty_bp > IO_PWM_DUTY_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (enabled) {
+        const esp_err_t err = io_pwm_start(channel, s_digital_gpio[channel], frequency_hz, duty_bp);
+        if (err != ESP_OK) {
+            /* The PWM allocator restores an existing waveform on failure.
+             * Restore the prior non-PWM pin mode if setup failed after routing. */
+            if (s_modes[channel] != IO_MODE_PWM && err != ESP_ERR_NOT_FOUND
+                && err != ESP_ERR_INVALID_ARG) {
+                (void)configure_gpio_mode(channel, s_modes[channel]);
+            }
+            return err;
+        }
+        s_modes[channel] = IO_MODE_PWM;
+    } else if (s_modes[channel] == IO_MODE_PWM) {
+        ESP_RETURN_ON_ERROR(io_model_set_mode(channel, IO_MODE_INPUT_FLOATING), TAG,
+                            "disable PWM channel %u", channel);
+    }
+    s_pwm_frequency[channel] = frequency_hz;
+    s_pwm_duty[channel] = duty_bp;
+    return ESP_OK;
+}
+
+esp_err_t io_model_pwm_get(uint16_t channel, uint32_t *frequency_hz,
+                           uint16_t *duty_bp, bool *enabled)
+{
+    if (!io_model_channel_available(channel) || frequency_hz == NULL
+        || duty_bp == NULL || enabled == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *frequency_hz = s_pwm_frequency[channel];
+    *duty_bp = s_pwm_duty[channel];
+    *enabled = s_modes[channel] == IO_MODE_PWM;
     return ESP_OK;
 }
 
@@ -248,7 +321,7 @@ static esp_err_t prepare_analog_channel(uint16_t channel, adc_unit_t *unit,
 
     /* Analog channel N maps to GPIO N+1, which is also digital channel N+1. */
     const uint16_t digital_channel = channel + 1U;
-    if (s_modes[digital_channel] == IO_MODE_OUTPUT) {
+    if (s_modes[digital_channel] == IO_MODE_OUTPUT || s_modes[digital_channel] == IO_MODE_PWM) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_modes[digital_channel] != IO_MODE_ANALOG) {

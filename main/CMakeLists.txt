@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app_main.c"
         "io_model.c"
+        "io_pwm.c"
         "modbus_server.c"
         "usb_modbus.c"
     INCLUDE_DIRS "."
