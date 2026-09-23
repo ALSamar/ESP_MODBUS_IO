@@ -57,6 +57,7 @@ class Api:
                 "description": item.description or "串口设备",
                 "vid": item.vid,
                 "pid": item.pid,
+                "location": item.location or "",
             }
             for item in ports
         ]
@@ -65,10 +66,17 @@ class Api:
             (
                 item["device"]
                 for item in rows
-                if item["vid"] == 0x303A and item["pid"] == 0x4001
+                if item["vid"] == 0x303A and item["pid"] == 0x4002
+                and item["location"].endswith(".0")
             ),
             "",
         )
+        if not native:
+            native = next(
+                (item["device"] for item in rows
+                 if item["vid"] == 0x303A and item["pid"] in (0x4001, 0x4002)),
+                "",
+            )
         recommended = (
             self.preferred_port
             if self.preferred_port in devices

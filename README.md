@@ -43,7 +43,7 @@ python tools/modbus_usb_gui.py --port COM19
 
 界面基于 Python 和 pywebview，支持设备信息、数字 IO、ADC、PWM、I²C 扫描和读写、SPI 全双工、UART 透传配置、通用串口终端（文本/HEX、时间戳、行尾、日志保存）以及最多 4 路轮询波形和 CSV 导出。串口终端可连接任意系统串口；选择 CDC1 时可直接收发 UART 字节。连接旧固件时，原有功能仍可使用，新总线功能按能力位提示不可用。
 
-程序会优先自动选择 VID/PID 为 `303A:4001` 的 ESP32-S3 USB CDC 串口。仓库只保存源码与文档；固件二进制、EXE、`build/`、`dist/` 和其他构建产物不提交。
+程序会优先自动选择 ESP32-S3 的控制口：1.2 双 CDC 固件通常枚举为 `303A:4002`（接口 0 为控制口，接口 2 为透传口）；旧单 CDC 固件为 `303A:4001`。实际 COM 号由系统分配，以设备信息读取成功为准。仓库只保存源码与文档；固件二进制、EXE、`build/`、`dist/` 和其他构建产物不提交。
 
 在 Windows 本地生成独立 EXE，输出为 `dist/ESP32-S3_Modbus_IO_Tool.exe`：
 

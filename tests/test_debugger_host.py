@@ -3,6 +3,7 @@ from pathlib import Path
 from importlib.util import module_from_spec, spec_from_file_location
 import sys
 from types import ModuleType
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -152,6 +153,17 @@ class DebuggerClientTests(unittest.TestCase):
         self.assertEqual(port.sent, ["你好".encode() + b"\r\n", b"\xaa\x55"])
         api.terminal_close()
         self.assertTrue(port.closed)
+
+    def test_gui_autoselects_control_cdc_interface(self):
+        ports = [
+            SimpleNamespace(device="COM3", description="PC", vid=None, pid=None, location=None),
+            SimpleNamespace(device="COM41", description="bridge", vid=0x303A, pid=0x4002,
+                            location="1-9.1:x.2"),
+            SimpleNamespace(device="COM43", description="control", vid=0x303A, pid=0x4002,
+                            location="1-9.1:x.0"),
+        ]
+        with patch.object(GUI.serial.tools.list_ports, "comports", return_value=ports, create=True):
+            self.assertEqual(GUI.Api().get_ports()["recommended"], "COM43")
 
 
 if __name__ == "__main__":
