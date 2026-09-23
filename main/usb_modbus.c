@@ -26,11 +26,9 @@
 /* I2C/SPI/UART drivers allocate CPU-local interrupts from this task. Keep
  * creation and deletion on one CPU; an unpinned task may migrate between the
  * two ESP32-S3 cores before a later "disable" command. */
-#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
-#define MODBUS_TASK_CORE 1
-#else
+/* TinyUSB's default task already runs on CPU1; keep the higher-priority
+ * Modbus worker on CPU0 so USB enumeration remains responsive. */
 #define MODBUS_TASK_CORE 0
-#endif
 
 typedef struct {
     size_t length;
