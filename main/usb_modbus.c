@@ -23,6 +23,15 @@
 #define USB_RX_QUEUE_DEPTH 8U
 #define USB_STREAM_BUFFER_SIZE 512U
 
+/* I2C/SPI/UART drivers allocate CPU-local interrupts from this task. Keep
+ * creation and deletion on one CPU; an unpinned task may migrate between the
+ * two ESP32-S3 cores before a later "disable" command. */
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+#define MODBUS_TASK_CORE 1
+#else
+#define MODBUS_TASK_CORE 0
+#endif
+
 typedef struct {
     size_t length;
     uint8_t data[USB_RX_CHUNK_SIZE];
@@ -192,7 +201,8 @@ esp_err_t usb_modbus_start(void)
     ESP_RETURN_ON_ERROR(tinyusb_cdcacm_init(&uart_cdc_config), TAG,
                         "initialize UART bridge CDC ACM");
 
-    if (xTaskCreate(usb_modbus_task, "usb_modbus", 6144, NULL, 10, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(usb_modbus_task, "usb_modbus", 6144, NULL, 10,
+                                NULL, MODBUS_TASK_CORE) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     if (xTaskCreate(uart_bridge_task, "uart_bridge", 4096, NULL, 9, NULL) != pdPASS) {
