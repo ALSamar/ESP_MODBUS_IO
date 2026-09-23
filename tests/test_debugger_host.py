@@ -163,7 +163,35 @@ class DebuggerClientTests(unittest.TestCase):
                             location="1-9.1:x.0"),
         ]
         with patch.object(GUI.serial.tools.list_ports, "comports", return_value=ports, create=True):
-            self.assertEqual(GUI.Api().get_ports()["recommended"], "COM43")
+            result = GUI.Api().get_ports()
+        self.assertEqual(result["recommended"], "COM43")
+        self.assertEqual(result["bridges"], {"COM43": "COM41"})
+
+    def test_gui_matches_bridge_on_same_usb_device_not_com_number(self):
+        ports = [
+            SimpleNamespace(device="COM4", description="bridge B", vid=0x303A, pid=0x4002,
+                            location="1-8.1:x.2"),
+            SimpleNamespace(device="COM17", description="control A", vid=0x303A, pid=0x4002,
+                            location="1-9.1:x.0"),
+            SimpleNamespace(device="COM53", description="bridge A", vid=0x303A, pid=0x4002,
+                            location="1-9.1:x.2"),
+            SimpleNamespace(device="COM61", description="control B", vid=0x303A, pid=0x4002,
+                            location="1-8.1:x.0"),
+        ]
+        with patch.object(GUI.serial.tools.list_ports, "comports", return_value=ports, create=True):
+            result = GUI.Api().get_ports()
+        self.assertEqual(result["bridges"], {"COM17": "COM53", "COM61": "COM4"})
+
+    def test_gui_reads_actual_gpio_mapping_for_wiring(self):
+        api = GUI.Api()
+        client = MagicMock()
+        api._client = lambda *args: client
+        api._device_info = lambda unused: {"usable_digital": 3}
+        client.read_registers.return_value = [0, 1, 2]
+        result = api.get_gpio_map("COM_TEST", 1)
+        self.assertEqual(result, {"ok": True, "data": [0, 1, 2]})
+        client.read_registers.assert_called_once_with(CLIENT.FUNCTION_READ_HOLDING_REGISTERS,
+                                                      0x0100, 3)
 
     def test_gui_i2c_missing_device_has_actionable_error(self):
         api = GUI.Api()

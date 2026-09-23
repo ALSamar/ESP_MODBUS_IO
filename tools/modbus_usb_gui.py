@@ -78,12 +78,27 @@ class Api:
                  if item["vid"] == 0x303A and item["pid"] in (0x4001, 0x4002)),
                 "",
             )
+        # Match the two interfaces of the same USB device by location, not
+        # by COM number (Windows may assign non-adjacent numbers or have more
+        # than one ESP32-S3 connected).
+        bridges = {}
+        for control in rows:
+            location = control["location"]
+            if control["vid"] != 0x303A or control["pid"] != 0x4002 or not location.endswith(".0"):
+                continue
+            peer_location = location[:-2] + ".2"
+            bridge = next((item["device"] for item in rows
+                           if item["vid"] == 0x303A and item["pid"] == 0x4002
+                           and item["location"] == peer_location), None)
+            if bridge:
+                bridges[control["device"]] = bridge
         recommended = (
             self.preferred_port
             if self.preferred_port in devices
             else native or (devices[-1] if devices else "")
         )
-        return {"ok": True, "ports": rows, "recommended": recommended}
+        return {"ok": True, "ports": rows, "recommended": recommended,
+                "bridges": bridges}
 
     @staticmethod
     def _client(port: str, slave: int) -> Client:
@@ -102,6 +117,13 @@ class Api:
 
     def get_info(self, port: str, slave: int) -> dict[str, Any]:
         return self._run(lambda: self._device_info(self._client(port, slave)))
+
+    def get_gpio_map(self, port: str, slave: int) -> dict[str, Any]:
+        def action() -> list[int]:
+            client = self._client(port, slave)
+            count = self._device_info(client)["usable_digital"]
+            return client.read_registers(FUNCTION_READ_HOLDING_REGISTERS, 0x0100, count)
+        return self._run(action)
 
     @staticmethod
     def _device_info(client: Client) -> dict[str, Any]:
@@ -506,7 +528,7 @@ main{height:calc(100vh - 192px);padding:20px 22px;overflow:hidden}.page{display:
 </style></head><body>
 <header><div><h1>ESP32-S3 · MODBUS IO</h1><p>Python USB CDC 设备调试与通道控制</p></div><div class="badge">Modbus RTU · USB CDC</div></header>
 <section class="connect"><span class="small">串口</span><select id="port"></select><button onclick="loadPorts()">刷新端口</button><span class="small" style="margin-left:10px">从站</span><input id="slave" type="number" min="1" max="247" value="1"><button class="primary" onclick="connectDevice()">连接并读取</button><span id="status">尚未连接</span></section>
-<nav><button class="active" data-page="info" onclick="showPage(this)">设备信息</button><button data-page="digital" onclick="showPage(this)">数字 IO</button><button data-page="analog" onclick="showPage(this)">模拟输入</button><button data-page="pwm" onclick="showPage(this)">PWM 输出</button><button data-page="buses" onclick="showPage(this)">I²C / SPI / UART</button><button data-page="terminal" onclick="showPage(this)">串口助手</button><button data-page="waveform" onclick="showPage(this)">实时波形</button><button data-page="logs" onclick="showPage(this)">日志</button></nav>
+<nav><button class="active" data-page="info" onclick="showPage(this)">设备信息</button><button data-page="digital" onclick="showPage(this)">数字 IO</button><button data-page="analog" onclick="showPage(this)">模拟输入</button><button data-page="pwm" onclick="showPage(this)">PWM 输出</button><button data-page="buses" onclick="showPage(this)">目标设备调试</button><button data-page="terminal" onclick="showPage(this)">UART 串口终端</button><button data-page="waveform" onclick="showPage(this)">实时波形</button><button data-page="logs" onclick="showPage(this)">日志</button></nav>
 <main>
 <section id="info" class="page active"><div class="cards">
 <div class="card"><div class="caption">协议版本</div><div id="protocol" class="value">—</div></div><div class="card"><div class="caption">固件版本</div><div id="firmware" class="value">—</div></div><div class="card"><div class="caption">数字通道</div><div id="digital-count" class="value">—</div></div>
@@ -520,23 +542,27 @@ main{height:calc(100vh - 192px);padding:20px 22px;overflow:hidden}.page{display:
 <button data-pwm class="primary" onclick="applyPwm()">应用参数</button><button data-pwm class="low" onclick="stopPwm()">停止所选通道</button><button data-pwm onclick="refreshPwm()">读取 PWM 状态</button></div>
 <div id="pwm-note">连接设备后可配置 PWM。频率 10～100000 Hz，占空比 0～100%，步进 0.01%。</div>
 <div class="tablebox"><table><thead><tr><th>通道</th><th>GPIO</th><th>设置频率</th><th>设置占空比</th><th>输出状态</th></tr></thead><tbody id="pwm-body"><tr><td colspan="5" class="empty">读取状态后点击通道行，可载入该通道参数</td></tr></tbody></table></div></section>
-<section id="buses" class="page tool-page"><div class="notice" style="margin:0 0 14px">I²C / SPI 收发通过 USB 控制口执行带地址、长度和时钟的事务；它们不是可无限接收的异步串口。UART 原始字节透传请使用第二个 USB 串口。</div><div class="tool-grid">
+<section id="buses" class="page tool-page"><div class="notice" style="margin:0 0 14px">
+<strong>用 ESP32-S3 调试外部设备：</strong>电脑 USB → 本板控制口 → 本板 GPIO → 目标设备。先连接设备并核对通道对应的 GPIO，再接线、配置协议、发送并查看返回结果。所有协议都要共地，GPIO 只能接 3.3 V 逻辑；不要把目标板的 5 V 信号直接接入。
+<div class="fields" style="margin-top:9px"><span>I²C：SDA、SCL、GND，目标设备需有合适上拉；填 7 位地址，可扫描和写/读。</span><span>SPI：SCLK、MOSI、MISO、CS、GND；每次发送时同时接收。</span><span>UART：本板 TX→目标 RX，本板 RX←目标 TX，另接 GND。</span></div>
+<div class="fields" style="margin-top:9px"><button class="primary" onclick="openUartDebugger()">配置并打开 UART 调试终端</button><span>UART 使用第二个 USB 串口；I²C/SPI 使用下面的事务面板，不能直接把任意串口字节无边界地送到总线。</span></div></div>
+<div class="tool-card"><h2>接线检查：所选通道对应的实际 GPIO</h2><p id="target-wiring" class="result">连接开发板后显示接线。修改下方通道号时会同步更新。</p></div><div class="tool-grid">
 <div><div class="tool-card"><h2>I²C 主机</h2><div class="fields"><label>SDA 通道 <input id="i2c-sda" type="number" min="0" max="33" value="4"></label><label>SCL 通道 <input id="i2c-scl" type="number" min="0" max="33" value="5"></label><label>频率 Hz <input id="i2c-hz" type="number" min="10000" max="400000" value="100000"></label><button class="primary" onclick="configureBus('i2c')">启用</button><button onclick="disableBus('i2c')">释放</button></div><p>需要外部上拉电阻。配置的是数字通道号，不是 GPIO 号；可在数字 IO 页查看映射。</p><div class="fields"><button onclick="scanI2c()">扫描 7 位地址</button><label>地址 <input id="i2c-address" value="0x50" class="wide"></label><label>读字节数 <input id="i2c-rx" type="number" min="0" max="128" value="0"></label></div><div class="fields" style="margin-top:9px"><label>写入 HEX <input id="i2c-tx" class="wide" placeholder="00 01 FF"></label><button onclick="transferBus('i2c')">执行写 / 读 / 写后读</button></div><p id="i2c-result" class="result">尚未执行事务</p></div>
-<div class="tool-card"><h2>UART1 ↔ USB CDC1 透传</h2><div class="fields"><label>TX 通道 <input id="uart-tx" type="number" min="0" max="33" value="25"></label><label>RX 通道 <input id="uart-rx" type="number" min="0" max="33" value="26"></label><label>波特率 <input id="uart-baud" type="number" min="300" max="2000000" value="115200"></label></div><div class="fields" style="margin-top:9px"><label>数据位 <select id="uart-data"><option>8</option><option>7</option></select></label><label>校验 <select id="uart-parity"><option value="0">无</option><option value="1">偶</option><option value="2">奇</option></select></label><label>停止位 <select id="uart-stop"><option>1</option><option>2</option></select></label><button class="primary" onclick="configureBus('uart')">启用</button><button onclick="disableBus('uart')">释放</button></div><p>控制命令经 CDC0 发送；目标 UART 原始字节经电脑上出现的第二个 COM 口传输。切到“串口助手”并选择第二个端口。</p></div></div>
+<div class="tool-card"><h2>UART1 ↔ USB CDC1 透传</h2><div class="fields"><label>TX 通道 <input id="uart-tx" type="number" min="0" max="33" value="25"></label><label>RX 通道 <input id="uart-rx" type="number" min="0" max="33" value="26"></label><label>波特率 <input id="uart-baud" type="number" min="300" max="2000000" value="115200"></label></div><div class="fields" style="margin-top:9px"><label>数据位 <select id="uart-data"><option>8</option><option>7</option></select></label><label>校验 <select id="uart-parity"><option value="0">无</option><option value="1">偶</option><option value="2">奇</option></select></label><label>停止位 <select id="uart-stop"><option>1</option><option>2</option></select></label><button class="primary" onclick="configureBus('uart')">仅启用</button><button onclick="disableBus('uart')">释放</button></div><p>可用上方一键按钮配置 UART 并打开目标设备终端；也可仅启用，然后在“UART 串口终端”页使用自动配对的第二个 COM 口。</p></div></div>
 <div><div class="tool-card"><h2>SPI 主机</h2><div class="fields"><label>SCLK <input id="spi-sclk" type="number" min="0" max="33" value="6"></label><label>MOSI <input id="spi-mosi" type="number" min="0" max="33" value="7"></label><label>MISO <input id="spi-miso" type="number" min="0" max="33" value="8"></label><label>CS <input id="spi-cs" type="number" min="0" max="33" value="9"></label></div><div class="fields" style="margin-top:9px"><label>模式 <select id="spi-mode"><option>0</option><option>1</option><option>2</option><option>3</option></select></label><label>频率 Hz <input id="spi-hz" type="number" min="10000" max="10000000" value="1000000"></label><button class="primary" onclick="configureBus('spi')">启用</button><button onclick="disableBus('spi')">释放</button></div><p>MISO、CS 可留空；无 CS 时需自行确保目标设备片选。每次事务同步收发相同字节数。</p><div class="fields"><label>发送 HEX <input id="spi-tx" class="wide" placeholder="9F 00 00 00"></label><button onclick="transferBus('spi')">全双工传输</button></div><p id="spi-result" class="result">尚未执行事务</p></div><div class="tool-card"><h2>外设状态</h2><button onclick="refreshBusStatus()">读取状态</button><p id="bus-status" class="result">连接协议 1.2 固件后读取</p><p>启用总线时，上位机只会把选中的输入或 ADC 通道切回浮空；数字输出、PWM 和其他总线不会被抢占。释放总线后引脚为浮空输入。</p></div></div></div><div class="tool-card"><div class="fields"><h2 style="margin-right:auto">I²C / SPI 协议收发记录</h2><button onclick="clearBusCapture()">清空</button><button onclick="saveBusCapture()">保存 TXT</button></div><pre id="bus-output">配置总线后执行扫描或收发，记录会显示在这里。</pre></div></section>
 <section id="terminal" class="page"><div class="toolbar"><label>端口 <select id="terminal-port"></select></label><button onclick="loadPorts()">刷新端口</button><label>波特率 <input id="terminal-baud" type="number" min="300" max="2000000" value="115200" style="width:100px"></label><select id="terminal-data"><option>8</option><option>7</option></select><select id="terminal-parity"><option value="N">无校验</option><option value="E">偶校验</option><option value="O">奇校验</option></select><select id="terminal-stop"><option>1</option><option>1.5</option><option>2</option></select><button class="primary" onclick="openTerminal()">打开</button><button onclick="closeTerminal()">关闭</button><span id="terminal-state" class="small">未打开</span></div><div class="toolbar"><label><input id="terminal-hex-view" type="checkbox" style="height:auto">HEX 显示</label><label><input id="terminal-stamp" type="checkbox" checked style="height:auto">时间戳</label><label><input id="terminal-scroll" type="checkbox" checked style="height:auto">自动滚动</label><button onclick="clearTerminal()">清空</button><button onclick="saveTerminal()">保存日志</button><span class="small">支持任意系统串口；打开 CDC0 时，请勿同时使用控制页</span></div><pre id="terminal-output"></pre><div class="terminal-send"><input id="terminal-input" placeholder="输入文本或空格分隔的十六进制字节；回车发送"><label><input id="terminal-hex-send" type="checkbox" style="height:auto">HEX 发送</label><select id="terminal-ending"><option value="">无行尾</option><option value="CR">CR</option><option value="LF">LF</option><option value="CRLF">CRLF</option></select><button class="primary" onclick="sendTerminal()">发送</button></div></section>
 <section id="waveform" class="page"><div class="toolbar"><label>信号 <input id="wave-signals" class="wide" value="A0,D0" placeholder="A0,D0" style="width:180px"></label><label>间隔 <select id="wave-interval"><option value="250">250 ms</option><option value="500">500 ms</option><option value="1000">1 s</option><option value="2000">2 s</option></select></label><button class="primary" onclick="startWaveform()">开始</button><button onclick="stopWaveform()">停止</button><button onclick="clearWaveform()">清空</button><button onclick="saveWaveform()">导出 CSV</button><span id="wave-state" class="small">D0～D33：数字电平；A0～A17：ADC 原始值；最多 4 路</span></div><div id="wave-legend"></div><canvas id="wave-canvas" width="1100" height="400"></canvas><p class="small">软件轮询波形用于趋势观察，不是逻辑分析仪或示波器；采样速率受 USB 往返和 ADC 测量耗时影响。</p></section>
 <section id="logs" class="page"><textarea id="log" readonly></textarea></section></main>
 <script>
-const $=id=>document.getElementById(id);let busy=0,device=null,pwmRows=[];const stamp=()=>new Date().toLocaleTimeString('zh-CN',{hour12:false});
+const $=id=>document.getElementById(id);let busy=0,device=null,pwmRows=[],portPairs={},pinMapping=[];const stamp=()=>new Date().toLocaleTimeString('zh-CN',{hour12:false});
 function log(s){$('log').value+=`[${stamp()}] ${s}\n`;$('log').scrollTop=$('log').scrollHeight}function status(s,k=''){$('status').textContent=s;$('status').className=k}
 function working(on,s='正在通信…'){busy=Math.max(0,busy+(on?1:-1));document.querySelectorAll('button').forEach(b=>b.disabled=busy>0||(b.hasAttribute('data-pwm')&&!device?.pwm));document.querySelectorAll('select,input').forEach(x=>x.disabled=busy>0);if(on)status(s,'busy')}
 function conn(){return{port:$('port').value,slave:Number($('slave').value)}}function fail(name,r){let s=r?.error||'未知错误';status(`失败：${s}`,'bad');log(`${name}失败：${s}`)}
 function showPage(b){document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));$(b.dataset.page).classList.add('active');if(b.dataset.page==='waveform')drawWave()}
 function level(v,label='—'){return v===null?`<span class="level na">${label}</span>`:v?'<span class="level on">高</span>':'<span class="level off">低</span>'}
 function useInfo(d){device=d;for(let id of ['channel','pwm-channel']){let box=$(id),old=box.value;box.innerHTML='';for(let i=0;i<d.usable_digital;i++){let o=document.createElement('option');o.value=i;o.textContent=i;box.appendChild(o)}if([...box.options].some(o=>o.value===old))box.value=old}let mode=$('mode'),extra=mode.querySelector('[value="5"]');if(d.pwm&&!extra){let o=document.createElement('option');o.value='5';o.textContent='PWM（已存参数）';mode.appendChild(o)}else if(!d.pwm&&extra)extra.remove();$('pwm-note').textContent=d.pwm?`10～100000 Hz；占空比 0～100%，步进 0.01%。最多 ${d.pwm_channels} 路同时输出、${d.pwm_frequencies} 种频率；同频率通道共享定时器。表中显示设定值，实际波形受硬件分辨率量化。参数断电复位，停止后恢复浮空输入。`:'当前固件不支持 PWM；数字 IO 和 ADC 可继续使用。更新到协议 1.1 后可配置 PWM。'}
-async function loadPorts(){working(true,'正在扫描串口…');try{let old=$('port').value,terminalOld=$('terminal-port').value,r=await pywebview.api.get_ports(),box=$('port'),tb=$('terminal-port');box.innerHTML='';tb.innerHTML='';r.ports.forEach(p=>{for(let target of [box,tb]){let o=document.createElement('option');o.value=p.device;o.textContent=`${p.device} · ${p.description}`;target.appendChild(o)}});box.value=[...box.options].some(o=>o.value===old)?old:r.recommended;tb.value=[...tb.options].some(o=>o.value===terminalOld)?terminalOld:r.ports.find(p=>p.device!==box.value)?.device||box.value;log(`发现串口：${r.ports.map(p=>p.device).join(', ')||'无'}`);status(r.ports.length?'请选择端口并连接':'未发现串口',r.ports.length?'':'bad')}catch(e){fail('扫描',{error:String(e)})}finally{working(false)}}
-async function connectDevice(){let c=conn();device=null;working(true,'正在读取设备信息…');try{let r=await pywebview.api.get_info(c.port,c.slave);if(!r.ok){fail('连接',r);return}let d=r.data;useInfo(d);$('protocol').textContent=d.protocol;$('firmware').textContent=d.firmware;$('digital-count').textContent=`${d.usable_digital} / ${d.digital}`;$('analog-count').textContent=d.analog;$('calibration').textContent=d.calibration?'可用':'不可用';$('reserved').textContent=d.gpio35_37?'已启用':'安全禁用';status(`已连接 · ${c.port} · 从站 ${c.slave}`,'good');log(`连接成功：协议 ${d.protocol}，固件 ${d.firmware}，PWM ${d.pwm?'可用':'不支持'}`)}catch(e){fail('连接',{error:String(e)})}finally{working(false)}}
+async function loadPorts(){working(true,'正在扫描串口…');try{let old=$('port').value,terminalOld=$('terminal-port').value,r=await pywebview.api.get_ports(),box=$('port'),tb=$('terminal-port');portPairs=r.bridges||{};box.innerHTML='';tb.innerHTML='';r.ports.forEach(p=>{for(let target of [box,tb]){let o=document.createElement('option');o.value=p.device;o.textContent=`${p.device} · ${p.description}`;target.appendChild(o)}});box.value=[...box.options].some(o=>o.value===old)?old:r.recommended;tb.value=[...tb.options].some(o=>o.value===terminalOld)?terminalOld:portPairs[box.value]||r.ports.find(p=>p.device!==box.value)?.device||box.value;log(`发现串口：${r.ports.map(p=>p.device).join(', ')||'无'}`);status(r.ports.length?'请选择端口并连接':'未发现串口',r.ports.length?'':'bad')}catch(e){fail('扫描',{error:String(e)})}finally{working(false)}}
+async function connectDevice(){let c=conn();device=null;pinMapping=[];working(true,'正在读取设备信息…');try{let r=await pywebview.api.get_info(c.port,c.slave);if(!r.ok){fail('连接',r);return}let d=r.data;useInfo(d);let map=await pywebview.api.get_gpio_map(c.port,c.slave);pinMapping=map.ok?map.data:[];updateWiring();if(!map.ok)log(`读取 GPIO 映射失败：${map.error}`);if(!terminalOpen&&portPairs[c.port])$('terminal-port').value=portPairs[c.port];if(d.debugger){let bus=await pywebview.api.bus_status(c.port,c.slave);if(bus.ok)syncBusControls(bus.data);else log(`读取总线状态失败：${bus.error}`)}$('protocol').textContent=d.protocol;$('firmware').textContent=d.firmware;$('digital-count').textContent=`${d.usable_digital} / ${d.digital}`;$('analog-count').textContent=d.analog;$('calibration').textContent=d.calibration?'可用':'不可用';$('reserved').textContent=d.gpio35_37?'已启用':'安全禁用';status(`已连接 · ${c.port} · 从站 ${c.slave}`,'good');log(`连接成功：协议 ${d.protocol}，固件 ${d.firmware}，PWM ${d.pwm?'可用':'不支持'}`)}catch(e){fail('连接',{error:String(e)})}finally{working(false)}}
 async function refreshDigital(){let c=conn();working(true,'正在读取数字 IO…');try{let r=await pywebview.api.read_digital(c.port,c.slave);if(!r.ok){fail('数字 IO',r);return}$('digital-body').innerHTML=r.data.map(x=>`<tr onclick="pick(${x.channel},this)"><td>${x.channel}</td><td>GPIO${x.gpio}</td><td>${x.mode_name}</td><td>${level(x.input,x.mode===5?'PWM':x.mode===4?'模拟':'—')}</td><td>${level(x.output,x.mode===5?'PWM':'—')}</td></tr>`).join('');status(`数字 IO 已刷新 · ${c.port}`,'good');log(`${r.data.length} 路数字 IO 读取成功`)}catch(e){fail('数字 IO',{error:String(e)})}finally{working(false)}}
 function pick(ch,row){$('channel').value=String(ch);document.querySelectorAll('#digital-body tr').forEach(r=>r.classList.remove('selected'));row.classList.add('selected')}
 async function refreshAnalog(){let c=conn();working(true,'正在读取 ADC…');try{let r=await pywebview.api.read_analog(c.port,c.slave);if(!r.ok){fail('ADC',r);return}$('analog-body').innerHTML=r.data.map(x=>`<tr><td>AI${x.channel}</td><td>GPIO${x.gpio}</td><td>${x.raw===null?x.state:x.raw}</td><td>${x.millivolts===null?'不可用':x.millivolts+' mV'}</td></tr>`).join('');status(`ADC 已刷新 · ${c.port}`,'good');log(`${r.data.filter(x=>x.raw!==null).length} 路 ADC 读取成功；输出通道保持不变`)}catch(e){fail('ADC',{error:String(e)})}finally{working(false)}}
@@ -551,9 +577,47 @@ function busAppend(message){let box=$('bus-output');box.textContent+=`[${stamp()
 function clearBusCapture(){$('bus-output').textContent=''}
 async function saveBusCapture(){let r=await pywebview.api.save_capture('bus',$('bus-output').textContent);if(!r.ok)fail('保存总线记录',r);else if(r.data)log(`总线记录已保存：${r.data}`)}
 function busOptions(kind){if(kind==='i2c')return{sda:$('i2c-sda').value,scl:$('i2c-scl').value,hz:$('i2c-hz').value};if(kind==='spi')return{sclk:$('spi-sclk').value,mosi:$('spi-mosi').value,miso:$('spi-miso').value,cs:$('spi-cs').value,mode:$('spi-mode').value,hz:$('spi-hz').value};return{tx:$('uart-tx').value,rx:$('uart-rx').value,baud:$('uart-baud').value,data_bits:$('uart-data').value,parity:$('uart-parity').value,stop_bits:$('uart-stop').value}}
+function wiringPin(id){let raw=$(id).value,ch=Number(raw);return raw!==''&&Number.isInteger(ch)&&ch>=0&&ch<pinMapping.length?`D${ch} → GPIO${pinMapping[ch]}`:'未选/无映射'}
+function updateWiring(){let box=$('target-wiring');box.textContent=pinMapping.length?`I²C  SDA ${wiringPin('i2c-sda')}，SCL ${wiringPin('i2c-scl')}，另接 GND\nSPI  SCLK ${wiringPin('spi-sclk')}，MOSI ${wiringPin('spi-mosi')}，MISO ${wiringPin('spi-miso')}，CS ${wiringPin('spi-cs')}，另接 GND\nUART  本板 TX ${wiringPin('uart-tx')} → 目标 RX；本板 RX ${wiringPin('uart-rx')} ← 目标 TX；另接 GND`:'连接开发板后显示接线。修改下方通道号时会同步更新。'}
 function showBus(s){$('bus-status').textContent=`I²C: ${s.i2c?`通道 ${s.i2c_pins.join('/')} · ${s.i2c_hz} Hz`:'关闭'}\nSPI: ${s.spi?`通道 ${s.spi_pins.join('/')} · 模式 ${s.spi_mode} · ${s.spi_hz} Hz`:'关闭'}\nUART: ${s.uart?`通道 ${s.uart_pins.join('/')} · ${s.uart_baud} bps · ${s.uart_data_bits}${['N','E','O'][s.uart_parity]}${s.uart_stop_bits}`:'关闭'}`}
-async function refreshBusStatus(){let c=conn();working(true,'读取总线状态…');try{requireDebugger();let r=await pywebview.api.bus_status(c.port,c.slave);if(!r.ok){fail('总线状态',r);return}showBus(r.data);status('总线状态已刷新','good')}catch(e){fail('总线状态',{error:String(e)})}finally{working(false)}}
+function syncBusControls(s){showBus(s);if(s.i2c){$('i2c-sda').value=s.i2c_pins[0];$('i2c-scl').value=s.i2c_pins[1];$('i2c-hz').value=s.i2c_hz}if(s.spi){for(let [id,pin] of [['spi-sclk',s.spi_pins[0]],['spi-mosi',s.spi_pins[1]],['spi-miso',s.spi_pins[2]],['spi-cs',s.spi_pins[3]]])$(id).value=pin??'';$('spi-mode').value=s.spi_mode;$('spi-hz').value=s.spi_hz}if(s.uart){$('uart-tx').value=s.uart_pins[0];$('uart-rx').value=s.uart_pins[1];$('uart-baud').value=s.uart_baud;$('uart-data').value=s.uart_data_bits;$('uart-parity').value=s.uart_parity;$('uart-stop').value=s.uart_stop_bits}updateWiring()}
+async function refreshBusStatus(){let c=conn();working(true,'读取总线状态…');try{requireDebugger();let r=await pywebview.api.bus_status(c.port,c.slave);if(!r.ok){fail('总线状态',r);return}syncBusControls(r.data);status('总线状态已刷新','good')}catch(e){fail('总线状态',{error:String(e)})}finally{working(false)}}
 async function configureBus(kind){let c=conn();working(true,`配置 ${kind.toUpperCase()}…`);try{requireDebugger();let r=await pywebview.api.bus_config(c.port,c.slave,kind,busOptions(kind));if(!r.ok){busAppend(`${kind.toUpperCase()} 启用失败：${r.error}`);fail('总线配置',r);return}showBus(r.data);busAppend(`${kind.toUpperCase()} 已启用 · ${JSON.stringify(busOptions(kind))}`);log(`${kind.toUpperCase()} 已启用；所用通道已锁定`);status(`${kind.toUpperCase()} 已启用`,'good')}catch(e){busAppend(`${kind.toUpperCase()} 启用失败：${e}`);fail('总线配置',{error:String(e)})}finally{working(false)}}
+async function openUartDebugger(){
+  let c=conn();working(true,'正在连接目标 UART…');
+  try{
+    if(!device?.uart)throw Error('请先连接支持 UART 调试的协议 1.2 固件');
+    let ports=await pywebview.api.get_ports(),bridge=(ports.bridges||{})[c.port];
+    if(!bridge)throw Error('未找到与控制口配对的第二个 USB 串口；请刷新端口并确认开发板使用原生 USB 接口');
+    portPairs=ports.bridges;
+    let r=await pywebview.api.bus_status(c.port,c.slave);
+    if(!r.ok)throw Error(r.error);
+    let requested=busOptions('uart');
+    if(r.data.uart&&(r.data.uart_pins[0]!==Number(requested.tx)||r.data.uart_pins[1]!==Number(requested.rx)||
+      r.data.uart_baud!==Number(requested.baud)||r.data.uart_data_bits!==Number(requested.data_bits)||
+      r.data.uart_parity!==Number(requested.parity)||r.data.uart_stop_bits!==Number(requested.stop_bits))){
+      showBus(r.data);
+      throw Error(`UART 已在通道 ${r.data.uart_pins.join('/')} 运行；如需改用当前填写的引脚/参数，请先在下方点击“释放”`);
+    }
+    if(!r.data.uart){
+      r=await pywebview.api.bus_config(c.port,c.slave,'uart',busOptions('uart'));
+      if(!r.ok)throw Error(r.error);
+      busAppend(`UART 已启用 · ${JSON.stringify(busOptions('uart'))}`);
+    }
+    let s=r.data,tb=$('terminal-port');
+    if(![...tb.options].some(o=>o.value===bridge)){let o=document.createElement('option');o.value=bridge;o.textContent=bridge+' · ESP32-S3 UART 透传口';tb.appendChild(o)}
+    tb.value=bridge;$('terminal-baud').value=s.uart_baud;$('terminal-data').value=s.uart_data_bits;
+    $('terminal-parity').value=['N','E','O'][s.uart_parity];$('terminal-stop').value=String(s.uart_stop_bits);
+    let opened=await pywebview.api.terminal_open(bridge,s.uart_baud,s.uart_data_bits,
+      ['N','E','O'][s.uart_parity],s.uart_stop_bits);
+    if(!opened.ok)throw Error(opened.error);
+    terminalOpen=true;terminalDecoder=new TextDecoder('utf-8');
+    $('terminal-state').textContent=`已连接目标设备 · ${bridge}`;
+    showBus(s);showPage(document.querySelector('nav button[data-page="terminal"]'));
+    log(`目标 UART 已连接：控制口 ${c.port}，透传口 ${bridge}，${s.uart_baud} bps`);
+    status(`目标 UART 调试就绪 · ${bridge}`,'good');
+  }catch(e){fail('打开 UART 调试终端',{error:String(e)})}finally{working(false)}
+}
 async function disableBus(kind){let c=conn();working(true,`释放 ${kind.toUpperCase()}…`);try{requireDebugger();let r=await pywebview.api.bus_disable(c.port,c.slave,kind);if(!r.ok){busAppend(`${kind.toUpperCase()} 释放失败：${r.error}`);fail('释放总线',r);return}showBus(r.data);busAppend(`${kind.toUpperCase()} 已释放`);log(`${kind.toUpperCase()} 已释放；引脚恢复浮空输入`);status(`${kind.toUpperCase()} 已释放`,'good')}catch(e){busAppend(`${kind.toUpperCase()} 释放失败：${e}`);fail('释放总线',{error:String(e)})}finally{working(false)}}
 async function scanI2c(){let c=conn();working(true,'正在扫描 I²C…');try{requireDebugger();let r=await pywebview.api.i2c_scan(c.port,c.slave);if(!r.ok){busAppend(`I²C SCAN 错误：${r.error}`);fail('I²C 扫描',r);return}let addresses=r.data.map(a=>`0x${a.toString(16).toUpperCase().padStart(2,'0')}`).join('  ');$('i2c-result').textContent=addresses||'没有发现应答设备';busAppend(`I²C SCAN → ${addresses||'无应答设备'}`);log(`I²C 扫描：${r.data.length} 个地址应答`);status('I²C 扫描完成','good')}catch(e){busAppend(`I²C SCAN 错误：${e}`);fail('I²C 扫描',{error:String(e)})}finally{working(false)}}
 async function transferBus(kind){let c=conn(),tx=$(kind+'-tx').value.trim(),addr=kind==='i2c'?Number($('i2c-address').value):0,rx=kind==='i2c'?Number($('i2c-rx').value):0;let label=kind==='i2c'?`I²C 0x${addr.toString(16).toUpperCase().padStart(2,'0')} · 读 ${rx} B`:'SPI 全双工';working(true,`${kind.toUpperCase()} 事务执行中…`);try{requireDebugger();let r=await pywebview.api.bus_transfer(c.port,c.slave,kind,addr,tx,rx);if(!r.ok){busAppend(`${label} · TX ${tx||'—'} · 错误 ${r.error}`);fail('总线事务',r);return}$(kind+'-result').textContent=`RX (${r.data.rx_count} B): ${r.data.rx_hex||'—'}`;busAppend(`${label} · TX ${tx||'—'} → RX ${r.data.rx_hex||'—'} (${r.data.rx_count} B)`);log(`${kind.toUpperCase()} TX ${tx||'—'} → RX ${r.data.rx_hex||'—'}`);status(`${kind.toUpperCase()} 事务完成`,'good')}catch(e){busAppend(`${label} · 错误 ${e}`);fail('总线事务',{error:String(e)})}finally{working(false)}}
@@ -574,7 +638,8 @@ function stopWaveform(){waveRunning=false;clearTimeout(waveTimer);$('wave-state'
 function clearWaveform(){waveRows=[];drawWave()}
 async function saveWaveform(){if(!waveRows.length){fail('导出波形',{error:'当前没有采样数据'});return}let header=['unix_ms','time',...waveSignals],rows=[header,...waveRows.map(row=>[row.time,new Date(row.time).toISOString(),...waveSignals.map(s=>row.values[s])])];let r=await pywebview.api.save_capture('waveform',rows);if(!r.ok)fail('导出波形',r);else if(r.data)log(`波形 CSV 已保存：${r.data}`)}
 setInterval(pollTerminal,120);$('terminal-input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendTerminal()}});
-for(let id of ['port','slave'])$(id).addEventListener('change',()=>{device=null;pwmRows=[];$('pwm-body').innerHTML='<tr><td colspan="5" class="empty">连接信息已更改，请重新连接并读取</td></tr>';$('pwm-note').textContent='请连接设备后配置 PWM';working(false);status('连接信息已更改，请点击连接并读取')});working(false);window.addEventListener('pywebviewready',async()=>{await loadPorts();if($('port').value)await connectDevice()});
+for(let id of ['i2c-sda','i2c-scl','spi-sclk','spi-mosi','spi-miso','spi-cs','uart-tx','uart-rx'])$(id).addEventListener('input',updateWiring);
+for(let id of ['port','slave'])$(id).addEventListener('change',()=>{device=null;pinMapping=[];updateWiring();pwmRows=[];$('pwm-body').innerHTML='<tr><td colspan="5" class="empty">连接信息已更改，请重新连接并读取</td></tr>';$('pwm-note').textContent='请连接设备后配置 PWM';working(false);status('连接信息已更改，请点击连接并读取')});working(false);window.addEventListener('pywebviewready',async()=>{await loadPorts();if($('port').value)await connectDevice()});
 </script></body></html>
 """
 
