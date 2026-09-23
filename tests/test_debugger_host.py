@@ -5,7 +5,7 @@ import sys
 from types import ModuleType
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 
 TOOLS = Path(__file__).parents[1] / "tools"
@@ -164,6 +164,59 @@ class DebuggerClientTests(unittest.TestCase):
         ]
         with patch.object(GUI.serial.tools.list_ports, "comports", return_value=ports, create=True):
             self.assertEqual(GUI.Api().get_ports()["recommended"], "COM43")
+
+    def test_gui_i2c_missing_device_has_actionable_error(self):
+        api = GUI.Api()
+        client = MagicMock()
+        client.__enter__.return_value = client
+        api._client = lambda *args: client
+        client.debugger_status.return_value = {"i2c": False, "spi": False}
+        result = api.i2c_scan("COM_TEST", 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("先启用 I²C", result["error"])
+        client.i2c_scan.assert_not_called()
+        result = api.bus_transfer("COM_TEST", 1, "i2c", 0x50, "00", 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("先启用 I2C", result["error"])
+        client.i2c_transfer.assert_not_called()
+
+        client.debugger_status.return_value = {"i2c": True, "spi": False}
+        client.i2c_transfer.side_effect = CLIENT.ModbusError("Modbus exception 0x04")
+        result = api.bus_transfer("COM_TEST", 1, "i2c", 0x50, "00", 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("没有设备应答", result["error"])
+
+    def test_gui_bus_config_releases_adc_inputs_but_not_outputs(self):
+        api = GUI.Api()
+        client = MagicMock()
+        client.__enter__.return_value = client
+        api._client = lambda *args: client
+        client.debugger_status.side_effect = [{"i2c": False}, {"i2c": True}]
+        client.read_registers.side_effect = [[4], [4]]
+        result = api.bus_config("COM_TEST", 1, "i2c", {"sda": "4", "scl": "5", "hz": "100000"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.set_mode.call_args_list, [call(4, 0), call(5, 0)])
+        client.i2c_config.assert_called_once_with(4, 5, 100000)
+
+        client.reset_mock()
+        client.debugger_status.side_effect = None
+        client.debugger_status.return_value = {"i2c": False}
+        client.read_registers.side_effect = [[3], [0]]
+        result = api.bus_config("COM_TEST", 1, "i2c", {"sda": "4", "scl": "5", "hz": "100000"})
+        self.assertFalse(result["ok"])
+        self.assertIn("正用于输出", result["error"])
+        client.set_mode.assert_not_called()
+        client.i2c_config.assert_not_called()
+
+        client.reset_mock()
+        client.debugger_status.side_effect = None
+        client.debugger_status.return_value = {"i2c": False}
+        client.read_registers.side_effect = [[4], [1]]
+        client.i2c_config.side_effect = CLIENT.ModbusError("Modbus exception 0x04")
+        result = api.bus_config("COM_TEST", 1, "i2c", {"sda": "4", "scl": "5", "hz": "100000"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(client.set_mode.call_args_list,
+                         [call(4, 0), call(5, 0), call(5, 1), call(4, 4)])
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import webview
 
 from modbus_usb_client import (
     Client,
+    ModbusError,
     FUNCTION_READ_COILS,
     FUNCTION_READ_DISCRETE_INPUTS,
     FUNCTION_READ_HOLDING_REGISTERS,
@@ -288,22 +289,51 @@ class Api:
 
     def bus_config(self, port: str, slave: int, kind: str,
                    options: dict[str, Any]) -> dict[str, Any]:
-        def action() -> dict[str, Any]:
-            client = self._client(port, slave)
+        def configure(client: Client) -> dict[str, Any]:
+            optional = lambda value: None if value in (None, "", "none") else int(value)
             if kind == "i2c":
-                client.i2c_config(int(options["sda"]), int(options["scl"]), int(options["hz"]))
+                pins = [int(options["sda"]), int(options["scl"])]
+                configure = lambda: client.i2c_config(*pins, int(options["hz"]))
             elif kind == "spi":
-                optional = lambda value: None if value in (None, "", "none") else int(value)
-                client.spi_config(int(options["sclk"]), int(options["mosi"]),
-                                  optional(options.get("miso")), optional(options.get("cs")),
-                                  int(options["mode"]), int(options["hz"]))
+                pins = [int(options["sclk"]), int(options["mosi"]),
+                        optional(options.get("miso")), optional(options.get("cs"))]
+                configure = lambda: client.spi_config(*pins, int(options["mode"]), int(options["hz"]))
             elif kind == "uart":
-                client.uart_config(int(options["tx"]), int(options["rx"]),
-                                   int(options["baud"]), int(options["data_bits"]),
-                                   int(options["parity"]), int(options["stop_bits"]))
+                pins = [int(options["tx"]), int(options["rx"])]
+                configure = lambda: client.uart_config(*pins, int(options["baud"]),
+                                                       int(options["data_bits"]),
+                                                       int(options["parity"]), int(options["stop_bits"]))
             else:
                 raise ValueError("未知总线类型")
+            active_pins = [pin for pin in pins if pin is not None]
+            if len(active_pins) != len(set(active_pins)) or any(not 0 <= pin < 34 for pin in active_pins):
+                raise ValueError("总线通道必须在 0～33 范围内，且不可重复")
+            if client.debugger_status()[kind]:
+                raise ValueError(f"{kind.upper()} 已启用；要更换引脚或频率，请先释放")
+            modes = {pin: client.read_registers(FUNCTION_READ_HOLDING_REGISTERS, pin, 1)[0]
+                     for pin in active_pins}
+            blocked = [pin for pin, mode in modes.items() if mode not in (0, 1, 2, 4)]
+            if blocked:
+                raise ValueError(f"通道 {blocked} 正用于输出、PWM 或其他总线；请先停止相应功能")
+            changed = []
+            try:
+                for pin, mode in modes.items():
+                    if mode != 0:
+                        client.set_mode(pin, 0)
+                        changed.append((pin, mode))
+                configure()
+            except Exception:
+                for pin, mode in reversed(changed):
+                    try:
+                        client.set_mode(pin, mode)
+                    except Exception:
+                        pass
+                raise
             return client.debugger_status()
+
+        def action() -> dict[str, Any]:
+            with self._client(port, slave) as client:
+                return configure(client)
         return self._run(action)
 
     def bus_disable(self, port: str, slave: int, kind: str) -> dict[str, Any]:
@@ -312,25 +342,43 @@ class Api:
                   "uart": DBG_UART_DISABLE}.get(kind)
             if op is None:
                 raise ValueError("未知总线类型")
-            client = self._client(port, slave)
-            client.debugger(op)
-            return client.debugger_status()
+            with self._client(port, slave) as client:
+                client.debugger(op)
+                return client.debugger_status()
         return self._run(action)
 
     def i2c_scan(self, port: str, slave: int) -> dict[str, Any]:
-        return self._run(lambda: self._client(port, slave).i2c_scan())
+        def action() -> list[int]:
+            with self._client(port, slave) as client:
+                if not client.debugger_status()["i2c"]:
+                    raise ValueError("请先启用 I²C，配置 SDA、SCL 和频率，再扫描地址")
+                try:
+                    return client.i2c_scan()
+                except ModbusError as error:
+                    if "0x04" in str(error):
+                        raise ModbusError("I²C 扫描失败：总线可能被拉低或驱动超时；请检查 SDA/SCL、上拉和供电") from error
+                    raise
+        return self._run(action)
 
     def bus_transfer(self, port: str, slave: int, kind: str,
                      address: int, tx_hex: str, rx_count: int) -> dict[str, Any]:
         def action() -> dict[str, Any]:
             tx = bytes.fromhex(tx_hex)
-            client = self._client(port, slave)
-            if kind == "i2c":
-                received = client.i2c_transfer(int(address), tx, int(rx_count))
-            elif kind == "spi":
-                received = client.spi_transfer(tx)
-            else:
-                raise ValueError("未知总线类型")
+            with self._client(port, slave) as client:
+                state = client.debugger_status()
+                if kind in ("i2c", "spi") and not state[kind]:
+                    raise ValueError(f"请先启用 {kind.upper()}，配置引脚后再收发")
+                if kind == "i2c":
+                    try:
+                        received = client.i2c_transfer(int(address), tx, int(rx_count))
+                    except ModbusError as error:
+                        if "0x04" in str(error):
+                            raise ModbusError("I²C 事务失败：目标地址可能没有设备应答，也可能是接线、上拉或时钟问题") from error
+                        raise
+                elif kind == "spi":
+                    received = client.spi_transfer(tx)
+                else:
+                    raise ValueError("未知总线类型")
             return {"rx_hex": received.hex(" ").upper(), "rx_count": len(received)}
         return self._run(action)
 
@@ -411,7 +459,7 @@ class Api:
 
     def save_capture(self, kind: str, rows: list[list[Any]] | str) -> dict[str, Any]:
         def action() -> str:
-            if kind not in ("waveform", "terminal"):
+            if kind not in ("waveform", "terminal", "bus"):
                 raise ValueError("未知导出类型")
             name = f"{kind}_{datetime.now():%Y%m%d_%H%M%S}." + ("csv" if kind == "waveform" else "txt")
             path = webview.windows[0].create_file_dialog(webview.SAVE_DIALOG, save_filename=name)
@@ -452,6 +500,7 @@ main{height:calc(100vh - 192px);padding:20px 22px;overflow:hidden}.page{display:
 #log{width:100%;height:100%;resize:none;border:1px solid var(--line);border-radius:8px;background:#172431;color:#d8e5f1;padding:15px;font:13px/1.55 Consolas,monospace}
 .pwm-controls{display:flex;flex-wrap:wrap;flex-shrink:0;gap:12px;align-items:center;padding:14px 16px;background:white;border:1px solid var(--line);border-radius:8px}.pwm-controls label{display:flex;align-items:center;gap:7px}.pwm-controls input[type=number]{width:112px}.pwm-controls input[type=checkbox]{height:auto}#pwm.active{display:flex;flex-direction:column}#pwm-note{flex-shrink:0;margin:12px 0;line-height:1.6;color:var(--muted)}#pwm .tablebox{height:auto;flex:1;min-height:0}
 .tool-page{overflow:auto}.tool-grid{display:grid;grid-template-columns:repeat(2,minmax(350px,1fr));gap:14px}.tool-card{background:white;border:1px solid var(--line);border-radius:8px;padding:15px;margin-bottom:14px}.tool-card h2{font-size:16px;margin:0 0 12px}.tool-card p{line-height:1.6;color:var(--muted);margin:9px 0}.fields{display:flex;flex-wrap:wrap;gap:9px;align-items:center}.fields label{display:flex;align-items:center;gap:5px}.fields input[type=number]{width:92px}.fields input.wide{width:180px}.fields select{min-width:74px}.result{font:13px/1.6 Consolas,monospace;white-space:pre-wrap;word-break:break-all;background:#f0f5f9;padding:10px;border-radius:6px;min-height:38px}
+#bus-output{height:220px;overflow:auto;background:#172431;color:#d8e5f1;border-radius:7px;padding:12px;font:13px/1.5 Consolas,monospace;white-space:pre-wrap;word-break:break-all}
 #terminal-output{height:calc(100% - 170px);min-height:220px;overflow:auto;background:#172431;color:#d8e5f1;border-radius:7px;padding:14px;font:13px/1.5 Consolas,monospace;white-space:pre-wrap;word-break:break-all}.terminal-send{width:100%;margin-top:10px;display:flex;gap:8px}.terminal-send input{flex:1}#terminal.active{display:flex;flex-direction:column;overflow:auto}#terminal .toolbar{height:auto;min-height:48px;flex-wrap:wrap}
 #waveform.active{display:flex;flex-direction:column;overflow:auto}#wave-canvas{width:100%;height:calc(100% - 132px);min-height:280px;background:white;border:1px solid var(--line);border-radius:8px}#wave-legend{height:32px;display:flex;gap:20px;align-items:center;color:var(--muted)}
 </style></head><body>
@@ -471,10 +520,10 @@ main{height:calc(100vh - 192px);padding:20px 22px;overflow:hidden}.page{display:
 <button data-pwm class="primary" onclick="applyPwm()">应用参数</button><button data-pwm class="low" onclick="stopPwm()">停止所选通道</button><button data-pwm onclick="refreshPwm()">读取 PWM 状态</button></div>
 <div id="pwm-note">连接设备后可配置 PWM。频率 10～100000 Hz，占空比 0～100%，步进 0.01%。</div>
 <div class="tablebox"><table><thead><tr><th>通道</th><th>GPIO</th><th>设置频率</th><th>设置占空比</th><th>输出状态</th></tr></thead><tbody id="pwm-body"><tr><td colspan="5" class="empty">读取状态后点击通道行，可载入该通道参数</td></tr></tbody></table></div></section>
-<section id="buses" class="page tool-page"><div class="tool-grid">
+<section id="buses" class="page tool-page"><div class="notice" style="margin:0 0 14px">I²C / SPI 收发通过 USB 控制口执行带地址、长度和时钟的事务；它们不是可无限接收的异步串口。UART 原始字节透传请使用第二个 USB 串口。</div><div class="tool-grid">
 <div><div class="tool-card"><h2>I²C 主机</h2><div class="fields"><label>SDA 通道 <input id="i2c-sda" type="number" min="0" max="33" value="4"></label><label>SCL 通道 <input id="i2c-scl" type="number" min="0" max="33" value="5"></label><label>频率 Hz <input id="i2c-hz" type="number" min="10000" max="400000" value="100000"></label><button class="primary" onclick="configureBus('i2c')">启用</button><button onclick="disableBus('i2c')">释放</button></div><p>需要外部上拉电阻。配置的是数字通道号，不是 GPIO 号；可在数字 IO 页查看映射。</p><div class="fields"><button onclick="scanI2c()">扫描 7 位地址</button><label>地址 <input id="i2c-address" value="0x50" class="wide"></label><label>读字节数 <input id="i2c-rx" type="number" min="0" max="128" value="0"></label></div><div class="fields" style="margin-top:9px"><label>写入 HEX <input id="i2c-tx" class="wide" placeholder="00 01 FF"></label><button onclick="transferBus('i2c')">执行写 / 读 / 写后读</button></div><p id="i2c-result" class="result">尚未执行事务</p></div>
 <div class="tool-card"><h2>UART1 ↔ USB CDC1 透传</h2><div class="fields"><label>TX 通道 <input id="uart-tx" type="number" min="0" max="33" value="25"></label><label>RX 通道 <input id="uart-rx" type="number" min="0" max="33" value="26"></label><label>波特率 <input id="uart-baud" type="number" min="300" max="2000000" value="115200"></label></div><div class="fields" style="margin-top:9px"><label>数据位 <select id="uart-data"><option>8</option><option>7</option></select></label><label>校验 <select id="uart-parity"><option value="0">无</option><option value="1">偶</option><option value="2">奇</option></select></label><label>停止位 <select id="uart-stop"><option>1</option><option>2</option></select></label><button class="primary" onclick="configureBus('uart')">启用</button><button onclick="disableBus('uart')">释放</button></div><p>控制命令经 CDC0 发送；目标 UART 原始字节经电脑上出现的第二个 COM 口传输。切到“串口助手”并选择第二个端口。</p></div></div>
-<div><div class="tool-card"><h2>SPI 主机</h2><div class="fields"><label>SCLK <input id="spi-sclk" type="number" min="0" max="33" value="6"></label><label>MOSI <input id="spi-mosi" type="number" min="0" max="33" value="7"></label><label>MISO <input id="spi-miso" type="number" min="0" max="33" value="8"></label><label>CS <input id="spi-cs" type="number" min="0" max="33" value="9"></label></div><div class="fields" style="margin-top:9px"><label>模式 <select id="spi-mode"><option>0</option><option>1</option><option>2</option><option>3</option></select></label><label>频率 Hz <input id="spi-hz" type="number" min="10000" max="10000000" value="1000000"></label><button class="primary" onclick="configureBus('spi')">启用</button><button onclick="disableBus('spi')">释放</button></div><p>MISO、CS 可留空；无 CS 时需自行确保目标设备片选。每次事务同步收发相同字节数。</p><div class="fields"><label>发送 HEX <input id="spi-tx" class="wide" placeholder="9F 00 00 00"></label><button onclick="transferBus('spi')">全双工传输</button></div><p id="spi-result" class="result">尚未执行事务</p></div><div class="tool-card"><h2>外设状态</h2><button onclick="refreshBusStatus()">读取状态</button><p id="bus-status" class="result">连接协议 1.2 固件后读取</p><p>总线配置前，请先将所选通道设置为“浮空输入”；释放后回到浮空输入。运行中的数字输出、PWM 和其他总线不会被抢占。</p></div></div></div></section>
+<div><div class="tool-card"><h2>SPI 主机</h2><div class="fields"><label>SCLK <input id="spi-sclk" type="number" min="0" max="33" value="6"></label><label>MOSI <input id="spi-mosi" type="number" min="0" max="33" value="7"></label><label>MISO <input id="spi-miso" type="number" min="0" max="33" value="8"></label><label>CS <input id="spi-cs" type="number" min="0" max="33" value="9"></label></div><div class="fields" style="margin-top:9px"><label>模式 <select id="spi-mode"><option>0</option><option>1</option><option>2</option><option>3</option></select></label><label>频率 Hz <input id="spi-hz" type="number" min="10000" max="10000000" value="1000000"></label><button class="primary" onclick="configureBus('spi')">启用</button><button onclick="disableBus('spi')">释放</button></div><p>MISO、CS 可留空；无 CS 时需自行确保目标设备片选。每次事务同步收发相同字节数。</p><div class="fields"><label>发送 HEX <input id="spi-tx" class="wide" placeholder="9F 00 00 00"></label><button onclick="transferBus('spi')">全双工传输</button></div><p id="spi-result" class="result">尚未执行事务</p></div><div class="tool-card"><h2>外设状态</h2><button onclick="refreshBusStatus()">读取状态</button><p id="bus-status" class="result">连接协议 1.2 固件后读取</p><p>启用总线时，上位机只会把选中的输入或 ADC 通道切回浮空；数字输出、PWM 和其他总线不会被抢占。释放总线后引脚为浮空输入。</p></div></div></div><div class="tool-card"><div class="fields"><h2 style="margin-right:auto">I²C / SPI 协议收发记录</h2><button onclick="clearBusCapture()">清空</button><button onclick="saveBusCapture()">保存 TXT</button></div><pre id="bus-output">配置总线后执行扫描或收发，记录会显示在这里。</pre></div></section>
 <section id="terminal" class="page"><div class="toolbar"><label>端口 <select id="terminal-port"></select></label><button onclick="loadPorts()">刷新端口</button><label>波特率 <input id="terminal-baud" type="number" min="300" max="2000000" value="115200" style="width:100px"></label><select id="terminal-data"><option>8</option><option>7</option></select><select id="terminal-parity"><option value="N">无校验</option><option value="E">偶校验</option><option value="O">奇校验</option></select><select id="terminal-stop"><option>1</option><option>1.5</option><option>2</option></select><button class="primary" onclick="openTerminal()">打开</button><button onclick="closeTerminal()">关闭</button><span id="terminal-state" class="small">未打开</span></div><div class="toolbar"><label><input id="terminal-hex-view" type="checkbox" style="height:auto">HEX 显示</label><label><input id="terminal-stamp" type="checkbox" checked style="height:auto">时间戳</label><label><input id="terminal-scroll" type="checkbox" checked style="height:auto">自动滚动</label><button onclick="clearTerminal()">清空</button><button onclick="saveTerminal()">保存日志</button><span class="small">支持任意系统串口；打开 CDC0 时，请勿同时使用控制页</span></div><pre id="terminal-output"></pre><div class="terminal-send"><input id="terminal-input" placeholder="输入文本或空格分隔的十六进制字节；回车发送"><label><input id="terminal-hex-send" type="checkbox" style="height:auto">HEX 发送</label><select id="terminal-ending"><option value="">无行尾</option><option value="CR">CR</option><option value="LF">LF</option><option value="CRLF">CRLF</option></select><button class="primary" onclick="sendTerminal()">发送</button></div></section>
 <section id="waveform" class="page"><div class="toolbar"><label>信号 <input id="wave-signals" class="wide" value="A0,D0" placeholder="A0,D0" style="width:180px"></label><label>间隔 <select id="wave-interval"><option value="250">250 ms</option><option value="500">500 ms</option><option value="1000">1 s</option><option value="2000">2 s</option></select></label><button class="primary" onclick="startWaveform()">开始</button><button onclick="stopWaveform()">停止</button><button onclick="clearWaveform()">清空</button><button onclick="saveWaveform()">导出 CSV</button><span id="wave-state" class="small">D0～D33：数字电平；A0～A17：ADC 原始值；最多 4 路</span></div><div id="wave-legend"></div><canvas id="wave-canvas" width="1100" height="400"></canvas><p class="small">软件轮询波形用于趋势观察，不是逻辑分析仪或示波器；采样速率受 USB 往返和 ADC 测量耗时影响。</p></section>
 <section id="logs" class="page"><textarea id="log" readonly></textarea></section></main>
@@ -498,13 +547,16 @@ async function refreshPwm(){let c=conn();working(true,'正在读取 PWM 状态�
 async function applyPwm(){let c=conn(),ch=Number($('pwm-channel').value);working(true,'正在配置 PWM…');try{let r=await pywebview.api.configure_pwm(c.port,c.slave,ch,$('pwm-frequency').value,$('pwm-duty').value,$('pwm-enabled').checked);if(!r.ok){fail('配置 PWM',r);return}log(`PWM 通道 ${ch}：${r.data.frequency} Hz，${r.data.duty}%，${r.data.enabled?'已启用':'已停用/存储'}`);await refreshPwm()}catch(e){fail('配置 PWM',{error:String(e)})}finally{working(false)}}
 async function stopPwm(){let c=conn(),ch=Number($('pwm-channel').value);working(true,'正在停止 PWM…');try{let r=await pywebview.api.stop_pwm(c.port,c.slave,ch);if(!r.ok){fail('停止 PWM',r);return}$('pwm-enabled').checked=false;log(`PWM 通道 ${ch} 已停用，频率和占空比设定保留`);await refreshPwm()}catch(e){fail('停止 PWM',{error:String(e)})}finally{working(false)}}
 function requireDebugger(){if(!device?.debugger)throw Error('请连接协议 1.2 固件；旧版设备不支持总线调试')}
+function busAppend(message){let box=$('bus-output');box.textContent+=`[${stamp()}] ${message}\n`;if(box.textContent.length>150000)box.textContent=box.textContent.slice(-100000);box.scrollTop=box.scrollHeight}
+function clearBusCapture(){$('bus-output').textContent=''}
+async function saveBusCapture(){let r=await pywebview.api.save_capture('bus',$('bus-output').textContent);if(!r.ok)fail('保存总线记录',r);else if(r.data)log(`总线记录已保存：${r.data}`)}
 function busOptions(kind){if(kind==='i2c')return{sda:$('i2c-sda').value,scl:$('i2c-scl').value,hz:$('i2c-hz').value};if(kind==='spi')return{sclk:$('spi-sclk').value,mosi:$('spi-mosi').value,miso:$('spi-miso').value,cs:$('spi-cs').value,mode:$('spi-mode').value,hz:$('spi-hz').value};return{tx:$('uart-tx').value,rx:$('uart-rx').value,baud:$('uart-baud').value,data_bits:$('uart-data').value,parity:$('uart-parity').value,stop_bits:$('uart-stop').value}}
 function showBus(s){$('bus-status').textContent=`I²C: ${s.i2c?`通道 ${s.i2c_pins.join('/')} · ${s.i2c_hz} Hz`:'关闭'}\nSPI: ${s.spi?`通道 ${s.spi_pins.join('/')} · 模式 ${s.spi_mode} · ${s.spi_hz} Hz`:'关闭'}\nUART: ${s.uart?`通道 ${s.uart_pins.join('/')} · ${s.uart_baud} bps · ${s.uart_data_bits}${['N','E','O'][s.uart_parity]}${s.uart_stop_bits}`:'关闭'}`}
 async function refreshBusStatus(){let c=conn();working(true,'读取总线状态…');try{requireDebugger();let r=await pywebview.api.bus_status(c.port,c.slave);if(!r.ok){fail('总线状态',r);return}showBus(r.data);status('总线状态已刷新','good')}catch(e){fail('总线状态',{error:String(e)})}finally{working(false)}}
-async function configureBus(kind){let c=conn();working(true,`配置 ${kind.toUpperCase()}…`);try{requireDebugger();let r=await pywebview.api.bus_config(c.port,c.slave,kind,busOptions(kind));if(!r.ok){fail('总线配置',r);return}showBus(r.data);log(`${kind.toUpperCase()} 已启用；所用通道已锁定`);status(`${kind.toUpperCase()} 已启用`,'good')}catch(e){fail('总线配置',{error:String(e)})}finally{working(false)}}
-async function disableBus(kind){let c=conn();working(true,`释放 ${kind.toUpperCase()}…`);try{requireDebugger();let r=await pywebview.api.bus_disable(c.port,c.slave,kind);if(!r.ok){fail('释放总线',r);return}showBus(r.data);log(`${kind.toUpperCase()} 已释放；引脚恢复浮空输入`);status(`${kind.toUpperCase()} 已释放`,'good')}catch(e){fail('释放总线',{error:String(e)})}finally{working(false)}}
-async function scanI2c(){let c=conn();working(true,'正在扫描 I²C…');try{requireDebugger();let r=await pywebview.api.i2c_scan(c.port,c.slave);if(!r.ok){fail('I²C 扫描',r);return}$('i2c-result').textContent=r.data.length?r.data.map(a=>`0x${a.toString(16).toUpperCase().padStart(2,'0')}`).join('  '):'没有发现应答设备';log(`I²C 扫描：${r.data.length} 个地址应答`);status('I²C 扫描完成','good')}catch(e){fail('I²C 扫描',{error:String(e)})}finally{working(false)}}
-async function transferBus(kind){let c=conn();working(true,`${kind.toUpperCase()} 事务执行中…`);try{requireDebugger();let tx=$(kind+'-tx').value,addr=kind==='i2c'?Number($('i2c-address').value):0,rx=kind==='i2c'?Number($('i2c-rx').value):0;let r=await pywebview.api.bus_transfer(c.port,c.slave,kind,addr,tx,rx);if(!r.ok){fail('总线事务',r);return}$(kind+'-result').textContent=`RX (${r.data.rx_count} B): ${r.data.rx_hex||'—'}`;log(`${kind.toUpperCase()} TX ${tx||'—'} → RX ${r.data.rx_hex||'—'}`);status(`${kind.toUpperCase()} 事务完成`,'good')}catch(e){fail('总线事务',{error:String(e)})}finally{working(false)}}
+async function configureBus(kind){let c=conn();working(true,`配置 ${kind.toUpperCase()}…`);try{requireDebugger();let r=await pywebview.api.bus_config(c.port,c.slave,kind,busOptions(kind));if(!r.ok){busAppend(`${kind.toUpperCase()} 启用失败：${r.error}`);fail('总线配置',r);return}showBus(r.data);busAppend(`${kind.toUpperCase()} 已启用 · ${JSON.stringify(busOptions(kind))}`);log(`${kind.toUpperCase()} 已启用；所用通道已锁定`);status(`${kind.toUpperCase()} 已启用`,'good')}catch(e){busAppend(`${kind.toUpperCase()} 启用失败：${e}`);fail('总线配置',{error:String(e)})}finally{working(false)}}
+async function disableBus(kind){let c=conn();working(true,`释放 ${kind.toUpperCase()}…`);try{requireDebugger();let r=await pywebview.api.bus_disable(c.port,c.slave,kind);if(!r.ok){busAppend(`${kind.toUpperCase()} 释放失败：${r.error}`);fail('释放总线',r);return}showBus(r.data);busAppend(`${kind.toUpperCase()} 已释放`);log(`${kind.toUpperCase()} 已释放；引脚恢复浮空输入`);status(`${kind.toUpperCase()} 已释放`,'good')}catch(e){busAppend(`${kind.toUpperCase()} 释放失败：${e}`);fail('释放总线',{error:String(e)})}finally{working(false)}}
+async function scanI2c(){let c=conn();working(true,'正在扫描 I²C…');try{requireDebugger();let r=await pywebview.api.i2c_scan(c.port,c.slave);if(!r.ok){busAppend(`I²C SCAN 错误：${r.error}`);fail('I²C 扫描',r);return}let addresses=r.data.map(a=>`0x${a.toString(16).toUpperCase().padStart(2,'0')}`).join('  ');$('i2c-result').textContent=addresses||'没有发现应答设备';busAppend(`I²C SCAN → ${addresses||'无应答设备'}`);log(`I²C 扫描：${r.data.length} 个地址应答`);status('I²C 扫描完成','good')}catch(e){busAppend(`I²C SCAN 错误：${e}`);fail('I²C 扫描',{error:String(e)})}finally{working(false)}}
+async function transferBus(kind){let c=conn(),tx=$(kind+'-tx').value.trim(),addr=kind==='i2c'?Number($('i2c-address').value):0,rx=kind==='i2c'?Number($('i2c-rx').value):0;let label=kind==='i2c'?`I²C 0x${addr.toString(16).toUpperCase().padStart(2,'0')} · 读 ${rx} B`:'SPI 全双工';working(true,`${kind.toUpperCase()} 事务执行中…`);try{requireDebugger();let r=await pywebview.api.bus_transfer(c.port,c.slave,kind,addr,tx,rx);if(!r.ok){busAppend(`${label} · TX ${tx||'—'} · 错误 ${r.error}`);fail('总线事务',r);return}$(kind+'-result').textContent=`RX (${r.data.rx_count} B): ${r.data.rx_hex||'—'}`;busAppend(`${label} · TX ${tx||'—'} → RX ${r.data.rx_hex||'—'} (${r.data.rx_count} B)`);log(`${kind.toUpperCase()} TX ${tx||'—'} → RX ${r.data.rx_hex||'—'}`);status(`${kind.toUpperCase()} 事务完成`,'good')}catch(e){busAppend(`${label} · 错误 ${e}`);fail('总线事务',{error:String(e)})}finally{working(false)}}
 let terminalOpen=false,terminalReading=false,terminalDecoder=new TextDecoder('utf-8');
 function terminalAppend(direction,hex){if(!hex)return;let bytes=Uint8Array.from(hex.split(' ').map(x=>parseInt(x,16))),body=$('terminal-hex-view').checked?hex:terminalDecoder.decode(bytes,{stream:true});let prefix=$('terminal-stamp').checked?`[${stamp()}] `:'';$('terminal-output').textContent+=`${prefix}${direction} ${body}\n`;if($('terminal-output').textContent.length>150000)$('terminal-output').textContent=$('terminal-output').textContent.slice(-100000);if($('terminal-scroll').checked)$('terminal-output').scrollTop=$('terminal-output').scrollHeight}
 async function openTerminal(){try{let r=await pywebview.api.terminal_open($('terminal-port').value,Number($('terminal-baud').value),Number($('terminal-data').value),$('terminal-parity').value,Number($('terminal-stop').value));if(!r.ok){fail('打开串口',r);return}terminalOpen=true;terminalDecoder=new TextDecoder('utf-8');$('terminal-state').textContent=`已打开 ${r.data.port}`;log(`串口助手打开 ${r.data.port}`)}catch(e){fail('打开串口',{error:String(e)})}}
