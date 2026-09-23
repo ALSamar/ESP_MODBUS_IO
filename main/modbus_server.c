@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "bus_debugger.h"
 #include "io_model.h"
 #include "sdkconfig.h"
 
@@ -15,6 +16,7 @@ enum {
     FC_WRITE_SINGLE_REGISTER = 0x06,
     FC_WRITE_MULTIPLE_COILS = 0x0F,
     FC_WRITE_MULTIPLE_REGISTERS = 0x10,
+    FC_DEBUGGER = 0x41,
 };
 
 enum {
@@ -34,8 +36,8 @@ enum {
     HR_PWM_STRIDE = 4,
     IR_RAW_BASE = 0x0000,
     IR_MV_BASE = 0x0100,
-    PROTOCOL_VERSION = 0x0101,
-    FIRMWARE_VERSION = 0x0101,
+    PROTOCOL_VERSION = 0x0102,
+    FIRMWARE_VERSION = 0x0102,
 };
 
 static uint16_t read_be16(const uint8_t *data)
@@ -91,6 +93,12 @@ size_t modbus_server_expected_request_length(const uint8_t *data, size_t length)
             return SIZE_MAX;
         }
         return 9U + data[6];
+    case FC_DEBUGGER:
+        if (length < 4U) {
+            return 0U;
+        }
+        return data[3] <= (MODBUS_RTU_MAX_ADU_SIZE - 6U)
+                   ? (size_t)data[3] + 6U : SIZE_MAX;
     default:
         /* All supported fixed-length requests and unsupported-function probes. */
         return 8U;
@@ -208,7 +216,7 @@ static esp_err_t read_holding_register(uint16_t address, uint16_t *value)
             *value = IO_ANALOG_CHANNEL_COUNT;
             break;
         case 4:
-            *value = (uint16_t)(4U | (io_model_calibration_supported() ? 1U : 0U) |
+            *value = (uint16_t)(4U | 8U | 16U | 32U | (io_model_calibration_supported() ? 1U : 0U) |
 #if CONFIG_USB_MODBUS_ENABLE_GPIO35_37
                                 2U
 #else
@@ -406,6 +414,14 @@ static esp_err_t write_multiple_coils(const uint8_t *request, size_t request_len
             return make_exception(request[0], request[1], EX_ILLEGAL_DATA_ADDRESS,
                                   response, capacity, response_length);
         }
+        uint16_t mode;
+        if (io_model_get_mode(start + offset, &mode) != ESP_OK || mode >= IO_MODE_I2C) {
+            if (broadcast) {
+                return ESP_OK;
+            }
+            return make_exception(request[0], request[1], EX_SERVER_DEVICE_FAILURE,
+                                  response, capacity, response_length);
+        }
     }
     for (uint16_t offset = 0; offset < quantity; ++offset) {
         const bool value = ((request[7U + (offset / 8U)] >> (offset % 8U)) & 1U) != 0U;
@@ -541,6 +557,35 @@ static esp_err_t write_multiple_registers(const uint8_t *request, size_t request
     return ESP_OK;
 }
 
+static esp_err_t debugger_request(const uint8_t *request, uint8_t *response,
+                                  size_t capacity, size_t *response_length)
+{
+    if (capacity < 6U) {
+        return ESP_ERR_NO_MEM;
+    }
+    size_t result_length = 0;
+    esp_err_t error = bus_debugger_command(request[2], &request[4], request[3],
+                                           &response[4], capacity - 6U, &result_length);
+    if (error != ESP_OK) {
+        const uint8_t exception = error == ESP_ERR_NOT_SUPPORTED ? EX_ILLEGAL_FUNCTION
+            : error == ESP_ERR_INVALID_ARG ? EX_ILLEGAL_DATA_VALUE
+            : error == ESP_ERR_NOT_FOUND ? EX_SERVER_DEVICE_BUSY
+            : EX_SERVER_DEVICE_FAILURE;
+        return make_exception(request[0], request[1], exception, response,
+                              capacity, response_length);
+    }
+    if (result_length > 250U || result_length > capacity - 6U) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    response[0] = request[0];
+    response[1] = FC_DEBUGGER;
+    response[2] = request[2];
+    response[3] = (uint8_t)result_length;
+    append_crc(response, result_length + 4U);
+    *response_length = result_length + 6U;
+    return ESP_OK;
+}
+
 esp_err_t modbus_server_process(const uint8_t *request, size_t request_length,
                                 uint8_t *response, size_t response_capacity,
                                 size_t *response_length)
@@ -595,6 +640,8 @@ esp_err_t modbus_server_process(const uint8_t *request, size_t request_length,
     case FC_WRITE_MULTIPLE_REGISTERS:
         return write_multiple_registers(request, request_length, broadcast, response,
                                         response_capacity, response_length);
+    case FC_DEBUGGER:
+        return debugger_request(request, response, response_capacity, response_length);
     default:
         if (broadcast) {
             return ESP_OK;

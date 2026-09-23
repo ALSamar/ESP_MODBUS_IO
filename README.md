@@ -1,6 +1,6 @@
 # ESP32-S3 USB Modbus IO
 
-本工程面向 ESP32-S3-WROOM-1 双 USB-C 开发板，使用 ESP-IDF 和 TinyUSB CDC-ACM 实现 Modbus RTU 串口 IO。从电脑上可读取数字输入、控制数字输出、读取 ADC 原始值和校准电压，并配置 PWM 频率和占空比。协议与固件版本为 1.1，保留 1.0 的数字 IO 和 ADC 地址。
+本工程面向 ESP32-S3-WROOM-1 双 USB-C 开发板，将其作为 USB 多协议 IO 调试器。USB CDC0 保留 Modbus RTU 数字 IO、ADC、PWM 控制，并增加可配置通道的 I²C、SPI、UART 调试事务；USB CDC1 是独立的 UART 原始字节透传口。上位机提供总线配置、串口助手和实时采样波形。协议与固件版本为 1.2，保留 1.0/1.1 的全部原有寄存器地址。
 
 PWM 支持 10 Hz～100 kHz、0%～100% 占空比；最多同时输出 8 路、使用 4 种不同频率。同频通道共享定时器，各通道占空比独立。所有参数只保存在内存中，重启后 GPIO 恢复浮空输入，PWM 全部关闭。
 
@@ -25,6 +25,8 @@ idf.py -p COMx flash
 
 工程默认关闭控制台输出，避免日志混入 Modbus 字节流，并释放 GPIO43/GPIO44。烧录完成后，将 USB 线接到原生 USB/OTG 口；如果没有出现新的 CDC 串口，请尝试开发板上的另一个 USB-C 接口并重新上电。
 
+1.2 固件会枚举两个虚拟串口。CDC0 是 Modbus 控制口，CDC1 是 UART 透传口。操作系统分配的 COM 号不保证连续或固定；先用 `info` 命令确认控制口，再在上位机“串口助手”中选择另一个口。旧工程若保留了本地 `sdkconfig`，需要在 `menuconfig` 确认 `TinyUSB CDC Channel Count = 2`；新克隆的工程由 `sdkconfig.defaults` 自动设置。
+
 ## 快速测试
 
 安装主机端依赖：
@@ -39,7 +41,7 @@ Python 图形测试工具：
 python tools/modbus_usb_gui.py --port COM19
 ```
 
-界面基于 Python 和 pywebview，支持端口选择、设备信息、数字 IO 状态、GPIO 模式设置、数字输出和 ADC 读取。PWM 页面可选择通道、输入频率（Hz）与占空比（%），应用并启动输出、停止输出或回读配置。连接旧版 1.0 固件时，原有功能仍可使用，PWM 控件按能力位禁用。
+界面基于 Python 和 pywebview，支持设备信息、数字 IO、ADC、PWM、I²C 扫描和读写、SPI 全双工、UART 透传配置、通用串口终端（文本/HEX、时间戳、行尾、日志保存）以及最多 4 路轮询波形和 CSV 导出。串口终端可连接任意系统串口；选择 CDC1 时可直接收发 UART 字节。连接旧固件时，原有功能仍可使用，新总线功能按能力位提示不可用。
 
 程序会优先自动选择 VID/PID 为 `303A:4001` 的 ESP32-S3 USB CDC 串口。仓库只保存源码与文档；固件二进制、EXE、`build/`、`dist/` 和其他构建产物不提交。
 
@@ -76,6 +78,27 @@ python tools/modbus_usb_client.py --port COM8 pwm-stop 1
 
 `pwm-set 1 1000 50 --disabled` 可保存本次运行期间的配置而不启动 PWM；若该通道正在输出 PWM，则停止并恢复浮空输入。
 
+配置 I²C 的 SDA/SCL 为数字通道 4/5（即 GPIO4/5），扫描和写后读：
+
+```powershell
+python tools/modbus_usb_client.py --port COM8 i2c-config 4 5 --hz 100000
+python tools/modbus_usb_client.py --port COM8 i2c-scan
+python tools/modbus_usb_client.py --port COM8 i2c-xfer 0x50 --write "00" --read 4
+python tools/modbus_usb_client.py --port COM8 i2c-off
+```
+
+配置 SPI 模式 0 并执行同步全双工事务，以及把通道 25/26 映射的 GPIO43/44 作为 UART TX/RX：
+
+```powershell
+python tools/modbus_usb_client.py --port COM8 spi-config 6 7 --miso 8 --cs 9 --mode 0 --hz 1000000
+python tools/modbus_usb_client.py --port COM8 spi-xfer "9F 00 00 00"
+python tools/modbus_usb_client.py --port COM8 spi-off
+python tools/modbus_usb_client.py --port COM8 uart-config 25 26 --baud 115200
+python tools/modbus_usb_client.py --port COM8 bus-status
+```
+
+UART 配置成功后用上位机“串口助手”打开 CDC1 端口。示例通道须先处于浮空输入状态；I²C 需外部上拉电阻。所有信号都是 3.3 V。波形图是软件轮询趋势图，不是高速逻辑分析仪。
+
 完整寄存器映射、报文格式和异常码见：
 
 - [`docs/ESP32-S3_USB_Modbus_IO_Protocol.md`](docs/ESP32-S3_USB_Modbus_IO_Protocol.md)
@@ -97,6 +120,7 @@ python tools/modbus_usb_client.py --port COM8 pwm-stop 1
 | `0x06` | Write Single Register | 设置单个 GPIO 通道模式 |
 | `0x0F` | Write Multiple Coils | 批量设置数字输出 |
 | `0x10` | Write Multiple Registers | 批量设置 GPIO 模式或写入单路完整 PWM 配置 |
+| `0x41` | Debugger Extension | I²C/SPI/UART 配置与事务、状态查询；仅单播 |
 
 ### 地址映射
 
@@ -134,18 +158,21 @@ GPIO19 和 GPIO20 用作 USB D- 和 D+，不进入 IO 地址表。模拟通道 0
 | `3` | 数字输出 |
 | `4` | 模拟输入，仅 GPIO1～18 支持 |
 | `5` | PWM 输出，使用保存的频率和占空比；初始为 1000 Hz、50% |
+| `6` | I²C 占用，只读状态，不能直接写入 |
+| `7` | SPI 占用，只读状态，不能直接写入 |
+| `8` | UART 占用，只读状态，不能直接写入 |
 
-写线圈会停止该通道 PWM 并进入数字输出；把 PWM 通道切换为模式 0～4 也会停止 PWM。读取 ADC 时，固件会自动切换到模拟模式，但对数字输出或 PWM 通道返回异常 `0x04`，保持原有输出。没有 ADC 校准数据时，毫伏寄存器返回 `0xFFFF`。PWM 模式下读离散输入只得到采样瞬间电平，读线圈仍得到最近一次数字输出命令值，都不能用来判断占空比。
+写线圈会停止该通道 PWM 并进入数字输出；把 PWM 通道切换为模式 0～4 也会停止 PWM。读取 ADC 时，固件会自动切换到模拟模式，但对数字输出、PWM 或总线占用通道返回异常 `0x04`，保持原有输出。模式 6～8 不能通过普通寄存器写入或释放，必须通过 `0x41` 配置/释放命令；普通线圈、模式、PWM 写入不会抢占正在使用的总线引脚。没有 ADC 校准数据时，毫伏寄存器返回 `0xFFFF`。
 
 ### 设备信息寄存器
 
 | 地址 | 内容 |
 |---:|---|
-| `0x0200` | 协议版本，当前 `0x0101` 表示 1.1 |
-| `0x0201` | 固件版本，当前 `0x0101` 表示 1.1 |
+| `0x0200` | 协议版本，当前 `0x0102` 表示 1.2 |
+| `0x0201` | 固件版本，当前 `0x0102` 表示 1.2 |
 | `0x0202` | 数字通道总数，当前为 34 |
 | `0x0203` | 模拟通道总数，当前为 18 |
-| `0x0204` | 能力位：bit0 表示 ADC 校准可用，bit1 表示 GPIO35～37 已启用，bit2 表示支持 PWM |
+| `0x0204` | 能力位：bit0 ADC 校准，bit1 GPIO35～37，bit2 PWM，bit3 I²C，bit4 SPI，bit5 UART CDC1 |
 | `0x0205` | 最大同时 PWM 输出通道数，当前为 8 |
 | `0x0206` | 最大同时使用的 PWM 频率种类，当前为 4 |
 
@@ -173,10 +200,29 @@ PWM 使用 LEDC 和 40 MHz XTAL 时钟，按频率选择 8～14 位计数分辨�
 | `0x01` | 不支持的功能码 |
 | `0x02` | 地址越界、通道禁用或模式不支持 |
 | `0x03` | 数量、字节数或写入值无效 |
-| `0x04` | 当前模式冲突或底层 GPIO/ADC/PWM 操作失败 |
+| `0x04` | 当前模式冲突或底层 GPIO/ADC/外设操作失败、超时或 NACK |
 | `0x06` | PWM 通道或定时器资源不足，设备忙 |
 
 地址 `0` 可用于广播写操作，设备执行合法写请求但不返回响应。CRC 错误、发往其他从站的请求以及超时的不完整帧也不会产生响应。
+
+### 总线调试扩展 `0x41`
+
+CDC0 的请求与成功响应均为 `从站 41 操作码 数据长度 数据 CRC低 CRC高`，长度字段各为 1 字节；`0x41` 不接受广播。出错时返回标准 Modbus 异常帧 `从站 C1 异常码 CRC低 CRC高`。每次请求最大 256 字节；I²C/SPI 单次收发各限 128 字节。多字节频率和波特率为 32 位大端整数；所有引脚字段是数字通道号，不是 GPIO 号，`FF` 仅用于省略 SPI MISO/CS。
+
+| 操作码 | 功能 | 请求数据 | 成功响应数据 |
+|---:|---|---|---|
+| `01` | 启用 I²C | `SDA SCL 频率4字节`，10～400 kHz | 空 |
+| `02` | 释放 I²C | 空 | 空 |
+| `03` | 扫描 I²C | 空 | 16 字节位图，bitN 对应 7 位地址 N，仅扫描 `08`～`77` |
+| `04` | I²C 事务 | `地址 写长度 读长度 写数据` | 读数据；写后读使用重复起始条件 |
+| `05` | 启用 SPI | `SCLK MOSI MISO CS 模式 频率4字节`，模式 0～3、10 kHz～10 MHz | 空 |
+| `06` | 释放 SPI | 空 | 空 |
+| `07` | SPI 全双工 | `长度 发送数据`，1～128 字节 | 同长度接收数据 |
+| `08` | 启用 UART | `TX RX 波特率4字节 数据位 校验 停止位` | 空；原始数据从 CDC1 收发 |
+| `09` | 释放 UART | 空 | 空 |
+| `0A` | 查询状态 | 空 | 25 字节状态记录，格式见完整协议书 |
+
+配置引脚前需把各通道设为浮空输入（模式 0）。同一总线重新配置时先释放再启用；外设配置仅在内存中保存，设备重启后全部关闭。I²C 为主机模式，目标设备需要外部上拉；SPI 为单设备全双工主机，可省略 MISO/CS；UART1 支持 300～2000000 bps、7/8 数据位、无/偶/奇校验、1/2 停止位，不支持硬件流控。CDC1 的“波特率”设置只影响 USB 虚拟串口参数，实际 UART 参数必须通过操作码 `08` 设置。CDC1 桥接缓冲有限，无流控时持续高速发送或主机长时间不接收可能丢字节；请按目标吞吐量实测。
 
 ### 报文示例
 
@@ -211,8 +257,9 @@ python -m unittest discover -s tests -v
 
 - `main/io_model.c`：GPIO 模式、数字 IO、ADC 单次采样与校准、LEDC PWM 资源管理。
 - `main/modbus_server.c`：Modbus RTU 功能码、CRC 和数据模型。
-- `main/usb_modbus.c`：TinyUSB CDC 收发、分帧、超时和流重同步。
+- `main/bus_debugger.c`：I²C/SPI/UART 驱动、总线事务和引脚资源控制。
+- `main/usb_modbus.c`：TinyUSB 双 CDC 收发、分帧、超时和 UART 字节桥接。
 - `tools/modbus_usb_client.py`：Windows/Linux/macOS 主机端测试程序。
-- `tools/modbus_usb_gui.py`：数字 IO、ADC 和 PWM 图形上位机。
+- `tools/modbus_usb_gui.py`：IO/PWM、I²C/SPI/UART、串口助手和波形上位机。
 - `tests/`：协议和上位机测试。
 - `scripts/build_protocol_docx.py`：生成 Word 协议文档；开发板图片位于 `docs/assets/`，也可通过 `--board-image` 指定。

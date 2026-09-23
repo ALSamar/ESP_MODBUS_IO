@@ -91,7 +91,15 @@ class FirmwareProtocolTests(unittest.TestCase):
         self.assertEqual(response[:3], bytes((request[0], request[1] | 128, code)))
 
     def test_legacy_info_and_pwm_capabilities(self):
-        self.assertEqual(self.registers(0x200, 7), [0x101, 0x101, 34, 18, 5, 8, 4])
+        self.assertEqual(self.registers(0x200, 7), [0x102, 0x102, 34, 18, 61, 8, 4])
+
+    def test_debugger_variable_frame_and_exception(self):
+        request = frame(bytes((1, 0x41, 10, 0)))
+        error, response = self.send(request)
+        self.assertEqual(error, 0)
+        self.assertEqual(response[:4], bytes((1, 0x41, 10, 25)))
+        self.assertEqual(response[4:-2], bytes(25))
+        self.exception(frame(bytes((1, 0x41, 99, 0))), 1)
 
     def test_defaults_and_uint32_frequency_round_trip(self):
         self.assertEqual(self.registers(0x304, 4), [0, 1000, 5000, 0])

@@ -1,12 +1,12 @@
 # ESP32-S3 USB Modbus IO 通信协议
 
-版本 1.1
+版本 1.2
 
-本文档说明 ESP32-S3-WROOM-1 开发板通过原生 USB CDC 虚拟串口提供的 Modbus RTU IO 服务。主站可按通道读取数字输入与输出状态、控制数字输出、读取 GPIO1 到 GPIO18 的 ADC 原始值和校准毫伏值，并设置 PWM 频率、占空比和启停状态。固件默认从站地址为 1。版本 1.1 新增 PWM，原有数字 IO 和 ADC 地址保持兼容。
+本文档说明 ESP32-S3-WROOM-1 开发板通过原生 USB CDC 虚拟串口提供的 Modbus RTU IO 服务。主站可读取数字 IO、ADC、PWM，并配置 I²C、SPI 与 UART 调试接口。CDC0 承载带 CRC 的控制事务，CDC1 承载 UART 原始字节。固件默认从站地址为 1。版本 1.2 保持 1.0/1.1 的数字 IO、ADC 和 PWM 地址兼容。
 
 ## 1 适用硬件
 
-固件按图示双 USB-C ESP32-S3-WROOM-1 开发板设计。通信必须使用连接 GPIO19 和 GPIO20 的原生 USB 或 OTG 接口。GPIO19 是 USB D-，GPIO20 是 USB D+，因此不进入 IO 地址表。USB CDC 是字节流传输，电脑端设置的波特率、数据位、停止位和校验位不改变链路实际速率。
+固件按图示双 USB-C ESP32-S3-WROOM-1 开发板设计。通信必须使用连接 GPIO19 和 GPIO20 的原生 USB 或 OTG 接口。GPIO19 是 USB D-，GPIO20 是 USB D+，因此不进入 IO 地址表。设备枚举两个 CDC 虚拟串口：CDC0 为 Modbus 控制口，CDC1 为 UART 透传口。USB CDC 是字节流传输，电脑端设置的波特率、数据位、停止位和校验位不改变 USB 链路实际速率，也不自动改变目标 UART 参数。
 
 GPIO35、GPIO36、GPIO37 在数字地址表中保留稳定通道号，但默认不可访问。这三个引脚可能连接 N8R8 或 N16R8 模组的八线 PSRAM。只有确认具体模组未占用后，才能打开 `CONFIG_USB_MODBUS_ENABLE_GPIO35_37`。
 
@@ -18,6 +18,8 @@ GPIO35、GPIO36、GPIO37 在数字地址表中保留稳定通道号，但默认�
 - GPIO0、GPIO3、GPIO45、GPIO46 是启动绑带引脚。外部电路不能在上电或复位采样期间改变所需启动电平。
 - GPIO0 通常还连接 BOOT 按键，GPIO48 通常连接板载 RGB LED。使用这些通道会同时影响板载电路。
 - GPIO39 到 GPIO42 具有 JTAG 复用功能，GPIO43 和 GPIO44 具有 UART0 复用功能。固件使用 USB CDC 并关闭控制台，运行后可将它们用作普通 GPIO。
+- I²C SDA/SCL 是开漏总线，需要根据目标电压和负载配置外部上拉。ESP32-S3 引脚仍只能承受 3.3 V 逻辑电平；不得把上拉接到 5 V。
+- SPI/UART 是 3.3 V 推挽/数字输入接口；跨电压域需要电平转换。不要让多个推挽输出同时驱动同一导线。
 
 ## 3 RTU 帧格式
 
@@ -46,6 +48,7 @@ USB 可能把一帧拆成多个数据块，也可能在一个数据块内携带�
 | `0x06` | Write Single Register | 设置一个通道的 GPIO 模式 |
 | `0x0F` | Write Multiple Coils | 批量设置数字输出，写入时自动切换为输出模式 |
 | `0x10` | Write Multiple Registers | 批量设置 GPIO 模式或写入单路完整 PWM 配置 |
+| `0x41` | Debugger Extension | I²C、SPI、UART 配置及事务、状态查询；仅单播 |
 
 未实现的功能码返回异常 `0x01`。
 
@@ -101,7 +104,7 @@ Modbus PDU 地址从 0 开始。文档中的传统线圈号和离散输入号从
 | `0x0000` 到 `0x0011` | 30001 到 30018 | ADC 原始值 | 典型范围 0 到 4095 |
 | `0x0100` 到 `0x0111` | 30257 到 30274 | 校准电压 | 单位 mV；无校准时返回 `0xFFFF` |
 
-读取模拟寄存器时，如果对应 GPIO 不是数字输出或 PWM 模式，固件会自动切换到模拟模式并采样。如果该 GPIO 正在数字输出或 PWM 输出，固件返回异常 `0x04`，保持原有输出。主站可先明确写保持寄存器把模式改为模拟输入，再读取 ADC。
+读取模拟寄存器时，如果对应 GPIO 不是数字输出、PWM 或总线占用模式，固件会自动切换到模拟模式并采样。如果该 GPIO 正在输出或被外设占用，固件返回异常 `0x04`，保持原有状态。主站可先明确写保持寄存器把可用模式改为模拟输入，再读取 ADC。
 
 校准毫伏值来自 ESP-IDF ADC 曲线拟合校准接口。芯片或构建配置不支持校准时，原始 ADC 寄存器仍然可用，毫伏寄存器返回 `0xFFFF`。ADC 结果受输入源阻抗、噪声、板级布局和芯片误差影响，不应直接作为计量级结果。
 
@@ -119,8 +122,13 @@ PDU 地址 `0x0000` 到 `0x0021` 对应数字通道 0 到 33。可用 `0x03` 读
 | 3 | 数字输出；保留最近一次线圈命令值 |
 | 4 | 模拟输入；仅数字通道 1 到 18 有效 |
 | 5 | PWM 输出；使用该通道当前保存的频率和占空比，初始配置为 1000 Hz、50% |
+| 6 | I²C 占用；只读，不能通过 `0x06` 或 `0x10` 直接写入 |
+| 7 | SPI 占用；只读，不能通过 `0x06` 或 `0x10` 直接写入 |
+| 8 | UART 占用；只读，不能通过 `0x06` 或 `0x10` 直接写入 |
 
 写线圈会自动把相应通道切换到模式 3，并停止该通道的 PWM。把 PWM 通道改为模式 0 到 4 也会停止 PWM 并释放资源；切换到数字输出模式 3 时恢复最近一次线圈命令值。不可用通道或不支持的模式组合返回异常。
+
+模式 6～8 只能由 `0x41` 外设配置命令建立，并由对应释放命令解除。处于外设占用状态的通道拒绝普通线圈、模式、PWM 和 ADC 操作，返回异常 `0x04`，避免已连接总线被普通 IO 命令改写。总线配置只接受当前为模式 0 的引脚；需要把上拉、下拉或模拟输入通道明确切换回模式 0 后再配置。
 
 模式 5 可用 `0x06` 或数量为 1 的 `0x10` 写入。多个 GPIO 模式的批量写只要包含模式 5，整条请求就返回 `0x03`，不会先启动其中部分通道；不包含模式 5 的批量写保持原有用法。需要启动多路 PWM 时，请逐路写完整 PWM 配置记录并检查响应。
 
@@ -132,11 +140,11 @@ PDU 地址 `0x0100` 到 `0x0121` 只读，对应数字通道 0 到 33，寄存�
 
 | PDU 地址 | 传统寄存器号 | 内容 | 当前值 |
 |---:|---:|---|---:|
-| `0x0200` | 40513 | 协议版本 | `0x0101` 表示 1.1 |
-| `0x0201` | 40514 | 固件版本 | `0x0101` 表示 1.1 |
+| `0x0200` | 40513 | 协议版本 | `0x0102` 表示 1.2 |
+| `0x0201` | 40514 | 固件版本 | `0x0102` 表示 1.2 |
 | `0x0202` | 40515 | 数字通道总数 | 34 |
 | `0x0203` | 40516 | 模拟通道总数 | 18 |
-| `0x0204` | 40517 | 能力位 | bit0 有 ADC 校准；bit1 已启用 GPIO35 到 GPIO37；bit2 支持 PWM |
+| `0x0204` | 40517 | 能力位 | bit0 ADC 校准；bit1 GPIO35 到 GPIO37；bit2 PWM；bit3 I²C；bit4 SPI；bit5 UART CDC1 |
 | `0x0205` | 40518 | 最大同时 PWM 输出数 | 8 |
 | `0x0206` | 40519 | 最大同时 PWM 频率种类 | 4 |
 
@@ -200,7 +208,7 @@ PWM 是 3.3 V 数字脉冲，不是 DAC 模拟电压。外部电路需要平滑�
 | `0x01` | Illegal Function | 不支持该功能码 |
 | `0x02` | Illegal Data Address | 地址越界、通道禁用或模式能力不匹配 |
 | `0x03` | Illegal Data Value | 数量、字节数、线圈编码、模式值或 PWM 参数和写入格式无效 |
-| `0x04` | Server Device Failure | 当前模式冲突或底层 GPIO ADC PWM 操作失败 |
+| `0x04` | Server Device Failure | 当前模式冲突，或底层 GPIO ADC PWM I²C SPI UART 操作失败、超时、NACK |
 | `0x06` | Server Device Busy | PWM 输出通道或定时器资源不足 |
 
 CRC 错误、发给其他从站的请求以及不完整超时帧不会产生响应。
@@ -292,7 +300,7 @@ python tools/modbus_usb_client.py --port COM8 pwm-set 1 1000 25 --disabled
 
 `pwm-set` 的三个参数依次为数字通道号、整数频率 Hz、占空比百分数，支持如 `12.34` 的占空比。默认配置后立即启动；`--disabled` 保存参数但不启动，并停止该通道已有的 PWM。`pwm-read` 回读频率、占空比和当前使能，`pwm-stop` 停止 PWM 并保留配置。
 
-图形上位机运行命令为 `python tools/modbus_usb_gui.py --port COM8`。PWM 页面提供通道选择、频率 Hz、占空比 %、应用并启动、停止和回读。旧版 1.0 固件的数字 IO 和 ADC 仍可使用，PWM 功能按设备能力位禁用。
+图形上位机运行命令为 `python tools/modbus_usb_gui.py --port COM8`。除数字 IO、ADC 和 PWM 外，1.2 上位机包含 I²C/SPI/UART 配置、串口助手及实时轮询波形。串口助手可打开任意系统串口，支持文本/HEX、时间戳、行尾和日志导出；波形支持最多 4 路 D 或 A 信号及 CSV 导出。软件轮询波形仅用于趋势观察，不是高速逻辑分析仪。旧版固件仍可使用对应能力的功能。
 
 ## 12 构建配置
 
@@ -303,13 +311,88 @@ idf.py build
 idf.py -p COMx flash
 ```
 
-菜单 `USB Modbus IO` 可设置从站地址、不完整帧超时和 GPIO35 到 GPIO37 的兼容开关。默认关闭控制台输出，UART0 日志不会污染 Modbus CDC 字节流。烧录后应把通信线连接到原生 USB 或 OTG 口；另一 USB-C 口如果经过 USB 转串口芯片，只用于 UART 烧录或调试，不承载本协议。
+菜单 `USB Modbus IO` 可设置从站地址、不完整帧超时和 GPIO35 到 GPIO37 的兼容开关。默认关闭控制台输出，UART0 日志不会污染 Modbus CDC 字节流。默认 TinyUSB CDC 数量为 2；若本地旧 `sdkconfig` 覆盖默认值，须在 `menuconfig` 将 CDC Channel Count 设为 2。烧录后应把通信线连接到原生 USB 或 OTG 口；另一 USB-C 口如果经过 USB 转串口芯片，只用于 UART 烧录或调试，不承载本协议。
 
-## 13 参考资料
+## 13 总线调试扩展
+
+### 13.1 双 CDC 与帧格式
+
+CDC0 保留标准 Modbus RTU 从站及全部原寄存器。I²C/SPI/UART 配置、I²C/SPI 有界事务经自定义功能码 `0x41` 传输。请求与成功响应均为：
+
+```text
+从站地址(1)  41(1)  操作码(1)  数据长度(1)  数据(0～250)  CRC低(1) CRC高(1)
+```
+
+`数据长度` 只计数据字段，不含操作码和 CRC；多字节频率、波特率以高字节先发送。请求和响应 ADU 最大 256 字节。`0x41` 不接受广播地址 0。出错返回 `从站 C1 异常码 CRC低 CRC高`；参数长度、范围不合法返回 `0x03`，通道被占用或驱动事务失败返回 `0x04`，未知操作码返回 `0x01`。主站应等待当前事务响应后再发送下一条；I²C 扫描最多遍历 112 个地址，主站超时建议至少 2 秒。
+
+CDC1 是独立的 UART1 原始字节桥，只有在操作码 `0x08` 成功后才转发数据，不使用 Modbus 帧或 CRC。系统给两个 CDC 口分配的端口号不保证固定或相邻。可以在 CDC0 发送 `info` 查询以区分控制口；再选择另一端口进行透传。电脑端对 CDC1 选择的波特率不自动改变 UART1；实际参数由操作码 `0x08` 决定。
+
+### 13.2 操作码和请求数据
+
+所有“引脚”字段都是第 5 节的数字通道号，不是 GPIO 号。配置前每个通道必须为模式 0（浮空输入）。同一外设改配置前应先调用释放命令；释放成功后引脚恢复模式 0。当前数字输出、PWM、模拟输入及其他总线占用通道不会被配置命令抢占。SPI 的 MISO、CS 可传 `FF` 表示省略；其他引脚不允许 `FF`。同一配置中非省略引脚不能重复。
+
+| 操作码 | 名称 | 请求数据 | 成功响应数据 |
+|---:|---|---|---|
+| `01` | I²C 启用 | `SDA SCL 频率(4)`；10,000～400,000 Hz | 空 |
+| `02` | I²C 释放 | 空 | 空 |
+| `03` | I²C 扫描 | 空 | 16 字节位图，bitN 对应 7 位地址 N |
+| `04` | I²C 事务 | `地址 写长度 读长度 写数据` | 指定长度的读数据 |
+| `05` | SPI 启用 | `SCLK MOSI MISO CS 模式 频率(4)` | 空 |
+| `06` | SPI 释放 | 空 | 空 |
+| `07` | SPI 全双工 | `长度 发送数据` | 同长度接收数据 |
+| `08` | UART1 启用 | `TX RX 波特率(4) 数据位 校验 停止位` | 空 |
+| `09` | UART1 释放 | 空 | 空 |
+| `0A` | 查询外设状态 | 空 | 25 字节状态记录 |
+
+I²C 工作在 7 位地址主机模式。`0x03` 仅探测 `0x08`～`0x77`，位图中地址 0～7、0x78～0x7F 始终为 0。`0x04` 地址限 `0x08`～`0x77`；写长度和读长度各为 0～128，但不能都为 0，请求数据长度必须等于 `3+写长度`。只有写时发送写数据；只有读时直接接收；同时写和读时用重复起始条件发起组合事务，中间不发 STOP。单次事务超时为 500 ms，扫描单地址探测超时为 5 ms。需在总线上配置与目标电压匹配的外部上拉，内部弱上拉不足以保证高速通信质量。ESP32-S3 引脚不得承受 5 V。
+
+SPI 使用 SPI2 主机、标准单线、MSB 优先和全双工模式。`0x05` 模式取 0～3，频率取 10,000～10,000,000 Hz；MISO/CS 省略时传 `FF`，SCLK/MOSI 必填。`0x07` 长度为 1～128，发送字节数必须等于长度，接收字节数同样等于长度。每次传输期间自动控制配置的 CS；若省略 CS，用户应自行控制目标设备的片选。实际频率受时钟分频和 GPIO 矩阵时序约束，高频通信需在目标连线上验证。
+
+UART 使用 UART1，波特率 300～2,000,000 bps，数据位只能 7 或 8；校验取 `0=无`、`1=偶`、`2=奇`；停止位取 1 或 2。没有 RTS/CTS 硬件流控。CDC1 USB 输入排队后转发到 UART1，UART1 接收字节转发到 CDC1；CDC1 不打开时接收数据被丢弃，不会在以后重放。USB 队列与 UART 缓冲有限，无流控时持续高速发送、主机长时间不读取或目标设备波特率不匹配都可能丢字节，不能将此桥接视为无损流记录器。
+
+### 13.3 状态记录
+
+操作码 `0A` 返回固定 25 字节，偏移按成功响应数据字段起算。未启用外设的引脚字段为 `FF`，频率或波特率为 0。
+
+| 偏移 | 长度 | 含义 |
+|---:|---:|---|
+| 0 | 1 | 标志：bit0 I²C 已启用、bit1 SPI 已启用、bit2 UART 已启用 |
+| 1～2 | 2 | I²C SDA、SCL 通道 |
+| 3～6 | 4 | SPI SCLK、MOSI、MISO、CS 通道 |
+| 7～8 | 2 | UART TX、RX 通道 |
+| 9～12 | 4 | I²C 请求频率，Hz |
+| 13～16 | 4 | SPI 请求频率，Hz |
+| 17～20 | 4 | UART 波特率，bps |
+| 21 | 1 | SPI 模式 0～3 |
+| 22 | 1 | UART 数据位数 7 或 8 |
+| 23 | 1 | UART 校验 0/1/2 |
+| 24 | 1 | UART 停止位数 1 或 2 |
+
+### 13.4 完整请求示例
+
+以下每行都含正确的 Modbus CRC，假设从站地址为 1。响应数据依目标设备而定。数字通道 4/5 映射 GPIO4/5，通道 25/26 映射 GPIO43/44。
+
+```text
+启用 I²C，SDA=4，SCL=5，100 kHz：01 41 01 06 04 05 00 01 86 A0 44 01
+扫描 I²C 地址：                 01 41 03 00 51 3C
+向地址 0x50 写入 00 后读 4 字节：01 41 04 04 50 01 04 00 62 87
+启用 SPI，通道 6/7/8/9，模式 0，1 MHz：01 41 05 09 06 07 08 09 00 00 0F 42 40 DE 39
+SPI 发送 9F 00 00 00：          01 41 07 05 04 9F 00 00 00 6B DD
+启用 UART，TX=25，RX=26，115200 8N1：01 41 08 09 19 1A 00 01 C2 00 08 00 01 19 38
+查询状态：                     01 41 0A 00 57 6C
+```
+
+## 14 参考资料
 
 - Espressif ESP-IDF USB Device Stack: https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/usb_device.html
 - Espressif ESP-IDF ADC Oneshot Driver: https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/adc_oneshot.html
 - Espressif ESP-IDF LEDC Driver: https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/ledc.html
+
+- Espressif ESP-IDF I2C Master Driver: https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/i2c.html
+
+- Espressif ESP-IDF SPI Master Driver: https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/spi_master.html
+
+- Espressif ESP-IDF UART Driver: https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/uart.html
 - Espressif ESP32-S3 Series Datasheet: https://documentation.espressif.com/esp32_s3_datasheet_en.pdf
 - Modbus Application Protocol Specification V1.1b3: https://www.modbus.org/docs/Modbus_Application_Protocol_V1_1b3.pdf
 - Modbus over Serial Line Specification and Implementation Guide V1.02: https://www.modbus.org/docs/Modbus_over_serial_line_V1_02.pdf

@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 
 FUNCTION_READ_COILS = 0x01
@@ -17,6 +19,11 @@ FUNCTION_READ_INPUT_REGISTERS = 0x04
 FUNCTION_WRITE_SINGLE_COIL = 0x05
 FUNCTION_WRITE_SINGLE_REGISTER = 0x06
 FUNCTION_WRITE_MULTIPLE_REGISTERS = 0x10
+FUNCTION_DEBUGGER = 0x41
+DBG_I2C_CONFIG, DBG_I2C_DISABLE, DBG_I2C_SCAN, DBG_I2C_TRANSFER = 1, 2, 3, 4
+DBG_SPI_CONFIG, DBG_SPI_DISABLE, DBG_SPI_TRANSFER = 5, 6, 7
+DBG_UART_CONFIG, DBG_UART_DISABLE, DBG_STATUS = 8, 9, 10
+MAX_TRANSFER = 128
 PWM_BASE = 0x0300
 PWM_RECORD_SIZE = 4
 PWM_MIN_FREQUENCY = 10
@@ -110,6 +117,20 @@ class Client:
     port: str
     slave: int = 1
     timeout: float = 0.5
+    _connection: Any = field(default=None, init=False, repr=False)
+
+    def __enter__(self) -> "Client":
+        import serial
+        if self._connection is not None:
+            raise RuntimeError("serial session already open")
+        self._connection = serial.Serial(self.port, baudrate=115200,
+                                         timeout=self.timeout, write_timeout=self.timeout)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
 
     def transact(self, request: bytes) -> bytes:
         try:
@@ -119,8 +140,10 @@ class Client:
                 "pyserial is missing; run: python -m pip install -r requirements.txt"
             ) from error
 
-        with serial.Serial(self.port, baudrate=115200, timeout=self.timeout,
-                           write_timeout=self.timeout) as connection:
+        manager = (nullcontext(self._connection) if self._connection is not None else
+                   serial.Serial(self.port, baudrate=115200, timeout=self.timeout,
+                                 write_timeout=self.timeout))
+        with manager as connection:
             connection.reset_input_buffer()
             connection.write(request)
             connection.flush()
@@ -141,6 +164,9 @@ class Client:
                                            FUNCTION_READ_HOLDING_REGISTERS,
                                            FUNCTION_READ_INPUT_REGISTERS):
                             expected = 5 + response[2]
+                        elif response[1] == FUNCTION_DEBUGGER:
+                            if len(response) >= 4:
+                                expected = 6 + response[3]
                         else:
                             expected = 8
                     if expected is not None and len(response) >= expected:
@@ -206,6 +232,80 @@ class Client:
         config = self.read_pwm(channel)
         self.set_pwm(channel, config.frequency, config.duty_percent, False)
 
+    def debugger(self, operation: int, payload: bytes = b"") -> bytes:
+        if not 1 <= operation <= DBG_STATUS or len(payload) > 250:
+            raise ValueError("invalid debugger operation or payload length")
+        request = add_crc(bytes((self.slave, FUNCTION_DEBUGGER, operation, len(payload))) + payload)
+        response = self.transact(request)
+        if len(response) < 6 or response[2] != operation or len(response) != response[3] + 6:
+            raise ModbusError("debugger response operation or length mismatch")
+        return response[4:-2]
+
+    @staticmethod
+    def _channel(channel: int) -> int:
+        if isinstance(channel, bool) or not isinstance(channel, int) or not 0 <= channel < 34:
+            raise ValueError("channel must be in the range 0..33")
+        return channel
+
+    def i2c_config(self, sda: int, scl: int, frequency: int = 100_000) -> None:
+        if sda == scl or not 10_000 <= frequency <= 400_000:
+            raise ValueError("I2C pins must differ and frequency must be 10000..400000 Hz")
+        self.debugger(DBG_I2C_CONFIG, bytes((self._channel(sda), self._channel(scl))) + frequency.to_bytes(4, "big"))
+
+    def i2c_scan(self) -> list[int]:
+        bits = self.debugger(DBG_I2C_SCAN)
+        if len(bits) != 16:
+            raise ModbusError("invalid I2C scan bitmap")
+        return [address for address in range(8, 0x78) if bits[address // 8] & (1 << (address % 8))]
+
+    def i2c_transfer(self, address: int, write: bytes = b"", read_count: int = 0) -> bytes:
+        if not 8 <= address <= 0x77 or len(write) > MAX_TRANSFER or not 0 <= read_count <= MAX_TRANSFER or not (write or read_count):
+            raise ValueError("I2C requires a 7-bit address 0x08..0x77 and 1..128 transfer bytes")
+        data = self.debugger(DBG_I2C_TRANSFER, bytes((address, len(write), read_count)) + write)
+        if len(data) != read_count:
+            raise ModbusError("I2C read length mismatch")
+        return data
+
+    def spi_config(self, sclk: int, mosi: int, miso: int | None, cs: int | None,
+                   mode: int = 0, frequency: int = 1_000_000) -> None:
+        pins = [self._channel(sclk), self._channel(mosi)]
+        pins += [255 if miso is None else self._channel(miso), 255 if cs is None else self._channel(cs)]
+        if len(set(pin for pin in pins if pin != 255)) != len([pin for pin in pins if pin != 255]) or not 0 <= mode <= 3 or not 10_000 <= frequency <= 10_000_000:
+            raise ValueError("SPI pins must differ, mode 0..3, frequency 10000..10000000 Hz")
+        self.debugger(DBG_SPI_CONFIG, bytes(pins + [mode]) + frequency.to_bytes(4, "big"))
+
+    def spi_transfer(self, write: bytes) -> bytes:
+        if not 1 <= len(write) <= MAX_TRANSFER:
+            raise ValueError("SPI transfer must contain 1..128 bytes")
+        data = self.debugger(DBG_SPI_TRANSFER, bytes((len(write),)) + write)
+        if len(data) != len(write):
+            raise ModbusError("SPI read length mismatch")
+        return data
+
+    def uart_config(self, tx: int, rx: int, baud: int = 115200,
+                    data_bits: int = 8, parity: int = 0, stop_bits: int = 1) -> None:
+        if tx == rx or not 300 <= baud <= 2_000_000 or data_bits not in (7, 8) or parity not in (0, 1, 2) or stop_bits not in (1, 2):
+            raise ValueError("invalid UART pins or format")
+        payload = bytes((self._channel(tx), self._channel(rx))) + baud.to_bytes(4, "big")
+        self.debugger(DBG_UART_CONFIG, payload + bytes((data_bits, parity, stop_bits)))
+
+    def debugger_status(self) -> dict:
+        data = self.debugger(DBG_STATUS)
+        if len(data) != 25:
+            raise ModbusError("invalid debugger status length")
+        pin = lambda value: None if value == 255 else value
+        return {
+            "i2c": bool(data[0] & 1), "spi": bool(data[0] & 2), "uart": bool(data[0] & 4),
+            "i2c_pins": [pin(x) for x in data[1:3]],
+            "spi_pins": [pin(x) for x in data[3:7]],
+            "uart_pins": [pin(x) for x in data[7:9]],
+            "i2c_hz": int.from_bytes(data[9:13], "big"),
+            "spi_hz": int.from_bytes(data[13:17], "big"),
+            "uart_baud": int.from_bytes(data[17:21], "big"),
+            "spi_mode": data[21], "uart_data_bits": data[22],
+            "uart_parity": data[23], "uart_stop_bits": data[24],
+        }
+
     def write_coil(self, channel: int, state: bool) -> None:
         request = fixed_request(self.slave, FUNCTION_WRITE_SINGLE_COIL,
                                 channel, 0xFF00 if state else 0x0000)
@@ -234,7 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", required=True, help="USB CDC serial port, for example COM8")
     parser.add_argument("--slave", type=int, default=1, help="Modbus slave address (default: 1)")
-    parser.add_argument("--timeout", type=float, default=0.5, help="response timeout in seconds")
+    parser.add_argument("--timeout", type=float, default=2.0, help="response timeout in seconds")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     for name in ("read-inputs", "read-outputs", "read-modes", "read-map"):
@@ -266,6 +366,33 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("channel", type=int)
 
     subparsers.add_parser("info")
+    subparsers.add_parser("bus-status")
+    for name in ("i2c-off", "i2c-scan", "spi-off", "uart-off"):
+        subparsers.add_parser(name)
+    i2c = subparsers.add_parser("i2c-config")
+    i2c.add_argument("sda", type=int, help="digital channel, not GPIO number")
+    i2c.add_argument("scl", type=int)
+    i2c.add_argument("--hz", type=int, default=100_000)
+    i2c_transfer = subparsers.add_parser("i2c-xfer")
+    i2c_transfer.add_argument("address", type=lambda value: int(value, 0))
+    i2c_transfer.add_argument("--write", default="", help="hex bytes, e.g. '00 01'")
+    i2c_transfer.add_argument("--read", type=int, default=0)
+    spi = subparsers.add_parser("spi-config")
+    spi.add_argument("sclk", type=int)
+    spi.add_argument("mosi", type=int)
+    spi.add_argument("--miso", type=int)
+    spi.add_argument("--cs", type=int)
+    spi.add_argument("--mode", type=int, default=0, choices=range(4))
+    spi.add_argument("--hz", type=int, default=1_000_000)
+    spi_transfer = subparsers.add_parser("spi-xfer")
+    spi_transfer.add_argument("hex", help="1..128 hex bytes")
+    uart = subparsers.add_parser("uart-config")
+    uart.add_argument("tx", type=int)
+    uart.add_argument("rx", type=int)
+    uart.add_argument("--baud", type=int, default=115200)
+    uart.add_argument("--data-bits", type=int, choices=(7, 8), default=8)
+    uart.add_argument("--parity", choices=("N", "E", "O"), default="N")
+    uart.add_argument("--stop-bits", type=int, choices=(1, 2), default=1)
     return parser
 
 
@@ -325,6 +452,38 @@ def main() -> int:
                 limits = client.read_registers(FUNCTION_READ_HOLDING_REGISTERS, 0x0205, 2)
                 print(f"pwm_max_channels={limits[0]}")
                 print(f"pwm_max_frequencies={limits[1]}")
+            print(f"debugger_supported={bool(values[4] & 8)}")
+            print(f"spi_supported={bool(values[4] & 16)}")
+            print(f"uart_bridge_supported={bool(values[4] & 32)}")
+        elif args.command == "bus-status":
+            for key, value in client.debugger_status().items():
+                print(f"{key}={value}")
+        elif args.command == "i2c-config":
+            client.i2c_config(args.sda, args.scl, args.hz)
+            print(f"I2C enabled on channels SDA={args.sda} SCL={args.scl}, {args.hz} Hz")
+        elif args.command == "i2c-off":
+            client.debugger(DBG_I2C_DISABLE)
+            print("I2C disabled")
+        elif args.command == "i2c-scan":
+            print(" ".join(f"0x{address:02X}" for address in client.i2c_scan()) or "no devices")
+        elif args.command == "i2c-xfer":
+            data = client.i2c_transfer(args.address, bytes.fromhex(args.write), args.read)
+            print(data.hex(" ").upper())
+        elif args.command == "spi-config":
+            client.spi_config(args.sclk, args.mosi, args.miso, args.cs, args.mode, args.hz)
+            print(f"SPI enabled at {args.hz} Hz, mode {args.mode}")
+        elif args.command == "spi-off":
+            client.debugger(DBG_SPI_DISABLE)
+            print("SPI disabled")
+        elif args.command == "spi-xfer":
+            print(client.spi_transfer(bytes.fromhex(args.hex)).hex(" ").upper())
+        elif args.command == "uart-config":
+            client.uart_config(args.tx, args.rx, args.baud, args.data_bits,
+                               {"N": 0, "E": 1, "O": 2}[args.parity], args.stop_bits)
+            print("UART bridge enabled; open the second USB CDC serial port for raw bytes")
+        elif args.command == "uart-off":
+            client.debugger(DBG_UART_DISABLE)
+            print("UART bridge disabled")
         return 0
     except (ModbusError, OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

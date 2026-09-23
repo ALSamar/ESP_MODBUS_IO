@@ -1,6 +1,7 @@
 /* Test only: execute the production Modbus server with deterministic IO. */
 #include "io_model.h"
 #include "modbus_server.h"
+#include "bus_debugger.h"
 #include <stddef.h>
 
 void *memcpy(void *dest, const void *src, size_t n) {
@@ -20,6 +21,16 @@ static uint8_t request[256], response[256];
 static size_t response_length;
 static unsigned writes;
 static esp_err_t forced_error;
+
+esp_err_t bus_debugger_command(uint8_t op, const uint8_t *payload, size_t n,
+                               uint8_t *reply, size_t capacity, size_t *reply_length) {
+    (void)payload;
+    if (op != DBG_STATUS) return ESP_ERR_NOT_SUPPORTED;
+    if (n != 0 || capacity < 25) return ESP_ERR_INVALID_ARG;
+    memset(reply, 0, 25);
+    *reply_length = 25;
+    return ESP_OK;
+}
 
 void reset_mock(void) {
     memset(modes, 0, sizeof(modes));

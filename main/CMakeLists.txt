@@ -3,6 +3,7 @@ idf_component_register(
         "app_main.c"
         "io_model.c"
         "io_pwm.c"
+        "bus_debugger.c"
         "modbus_server.c"
         "usb_modbus.c"
     INCLUDE_DIRS "."

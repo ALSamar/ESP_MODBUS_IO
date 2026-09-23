@@ -8,6 +8,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "bus_debugger.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -16,6 +17,7 @@
 #include "tinyusb.h"
 #include "tinyusb_cdc_acm.h"
 #include "tinyusb_default_config.h"
+#include "tusb.h"
 
 #define USB_RX_CHUNK_SIZE 256U
 #define USB_RX_QUEUE_DEPTH 8U
@@ -28,6 +30,7 @@ typedef struct {
 
 static const char *TAG = "usb_modbus";
 static QueueHandle_t s_rx_queue;
+static QueueHandle_t s_uart_queue;
 
 static void cdc_rx_callback(int interface, cdcacm_event_t *event)
 {
@@ -38,6 +41,49 @@ static void cdc_rx_callback(int interface, cdcacm_event_t *event)
     if ((error == ESP_OK) && (message.length > 0U)) {
         if (xQueueSend(s_rx_queue, &message, 0) != pdTRUE) {
             ESP_LOGW(TAG, "RX queue full; dropped %u bytes", (unsigned)message.length);
+        }
+    }
+}
+
+static void uart_cdc_rx_callback(int interface, cdcacm_event_t *event)
+{
+    (void)event;
+    usb_rx_message_t message = {0};
+    if (tinyusb_cdcacm_read(interface, message.data, sizeof(message.data),
+                            &message.length) == ESP_OK && message.length) {
+        if (xQueueSend(s_uart_queue, &message, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "UART bridge RX queue full; dropped %u bytes", (unsigned)message.length);
+        }
+    }
+}
+
+static void uart_bridge_task(void *argument)
+{
+    (void)argument;
+    usb_rx_message_t incoming;
+    uint8_t outgoing[USB_RX_CHUNK_SIZE];
+    size_t queued = 0;
+    size_t offset = 0;
+    while (true) {
+        if (xQueueReceive(s_uart_queue, &incoming, pdMS_TO_TICKS(2)) == pdTRUE) {
+            const int written = bus_uart_write(incoming.data, incoming.length);
+            if (written < (int)incoming.length) {
+                ESP_LOGW(TAG, "UART bridge TX short write; dropped %u bytes",
+                         (unsigned)(incoming.length - (written > 0 ? written : 0)));
+            }
+        }
+        if (offset == queued) {
+            const int received = bus_uart_read(outgoing, sizeof(outgoing));
+            queued = received > 0 ? (size_t)received : 0;
+            offset = 0;
+        }
+        if (queued && !tud_cdc_n_connected(1)) {
+            queued = 0; /* No host is listening. Never replay stale bytes. */
+        }
+        if (queued) {
+            offset += tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_1,
+                                                   &outgoing[offset], queued - offset);
+            (void)tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_1, 0);
         }
     }
 }
@@ -122,6 +168,10 @@ esp_err_t usb_modbus_start(void)
     if (s_rx_queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_uart_queue = xQueueCreate(32, sizeof(usb_rx_message_t));
+    if (s_uart_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
 
     const tinyusb_config_t usb_config = TINYUSB_DEFAULT_CONFIG();
     ESP_RETURN_ON_ERROR(tinyusb_driver_install(&usb_config), TAG, "install TinyUSB driver");
@@ -135,7 +185,17 @@ esp_err_t usb_modbus_start(void)
     };
     ESP_RETURN_ON_ERROR(tinyusb_cdcacm_init(&cdc_config), TAG, "initialize CDC ACM");
 
+    const tinyusb_config_cdcacm_t uart_cdc_config = {
+        .cdc_port = TINYUSB_CDC_ACM_1,
+        .callback_rx = uart_cdc_rx_callback,
+    };
+    ESP_RETURN_ON_ERROR(tinyusb_cdcacm_init(&uart_cdc_config), TAG,
+                        "initialize UART bridge CDC ACM");
+
     if (xTaskCreate(usb_modbus_task, "usb_modbus", 6144, NULL, 10, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(uart_bridge_task, "uart_bridge", 4096, NULL, 9, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

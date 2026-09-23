@@ -8,8 +8,10 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
+#include "esp_rom_gpio.h"
 #include "io_pwm.h"
 #include "sdkconfig.h"
+#include "soc/gpio_sig_map.h"
 
 static const char *TAG = "io_model";
 
@@ -190,6 +192,9 @@ esp_err_t io_model_write_output(uint16_t channel, bool level)
     if (!io_model_channel_available(channel)) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_modes[channel] >= IO_MODE_I2C) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     if (s_modes[channel] != IO_MODE_OUTPUT) {
         const bool previous_level = s_output_state[channel];
@@ -211,7 +216,7 @@ esp_err_t io_model_read_digital(uint16_t channel, bool *level)
     if ((level == NULL) || !io_model_channel_available(channel)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_modes[channel] == IO_MODE_ANALOG) {
+    if (s_modes[channel] == IO_MODE_ANALOG || s_modes[channel] >= IO_MODE_I2C) {
         return ESP_ERR_INVALID_STATE;
     }
     *level = gpio_get_level(s_digital_gpio[channel]) != 0;
@@ -231,6 +236,9 @@ esp_err_t io_model_validate_mode(uint16_t channel, uint16_t mode)
 {
     if (!io_model_channel_available(channel) || (mode > IO_MODE_PWM)) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_modes[channel] >= IO_MODE_I2C) {
+        return ESP_ERR_INVALID_STATE;
     }
     if ((mode == IO_MODE_PWM || mode == IO_MODE_OUTPUT)
         && !GPIO_IS_VALID_OUTPUT_GPIO(s_digital_gpio[channel])) {
@@ -269,6 +277,38 @@ esp_err_t io_model_set_mode(uint16_t channel, uint16_t mode)
     return ESP_OK;
 }
 
+esp_err_t io_model_reserve_pin(uint16_t channel, io_mode_t owner, bool output)
+{
+    if (!io_model_channel_available(channel) || owner < IO_MODE_I2C
+        || owner > IO_MODE_UART) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (output && !GPIO_IS_VALID_OUTPUT_GPIO(s_digital_gpio[channel])) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    /* Never steal an active GPIO output, ADC, PWM, or other bus. */
+    if (s_modes[channel] != IO_MODE_INPUT_FLOATING) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_modes[channel] = owner;
+    return ESP_OK;
+}
+
+esp_err_t io_model_release_pin(uint16_t channel, io_mode_t owner)
+{
+    if (!io_model_channel_available(channel) || owner < IO_MODE_I2C
+        || owner > IO_MODE_UART || s_modes[channel] != owner) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(gpio_reset_pin(s_digital_gpio[channel]), TAG,
+                        "reset peripheral pin %u", channel);
+    esp_rom_gpio_connect_out_signal(s_digital_gpio[channel], SIG_GPIO_OUT_IDX, false, false);
+    ESP_RETURN_ON_ERROR(configure_gpio_mode(channel, IO_MODE_INPUT_FLOATING), TAG,
+                        "release peripheral pin %u", channel);
+    s_modes[channel] = IO_MODE_INPUT_FLOATING;
+    return ESP_OK;
+}
+
 esp_err_t io_model_pwm_configure(uint16_t channel, uint32_t frequency_hz,
                                  uint16_t duty_bp, bool enabled)
 {
@@ -277,6 +317,9 @@ esp_err_t io_model_pwm_configure(uint16_t channel, uint32_t frequency_hz,
         || frequency_hz < IO_PWM_MIN_FREQUENCY_HZ
         || frequency_hz > IO_PWM_MAX_FREQUENCY_HZ || duty_bp > IO_PWM_DUTY_MAX) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_modes[channel] >= IO_MODE_I2C) {
+        return ESP_ERR_INVALID_STATE;
     }
     if (enabled) {
         const esp_err_t err = io_pwm_start(channel, s_digital_gpio[channel], frequency_hz, duty_bp);
@@ -321,7 +364,8 @@ static esp_err_t prepare_analog_channel(uint16_t channel, adc_unit_t *unit,
 
     /* Analog channel N maps to GPIO N+1, which is also digital channel N+1. */
     const uint16_t digital_channel = channel + 1U;
-    if (s_modes[digital_channel] == IO_MODE_OUTPUT || s_modes[digital_channel] == IO_MODE_PWM) {
+    if (s_modes[digital_channel] == IO_MODE_OUTPUT || s_modes[digital_channel] == IO_MODE_PWM
+        || s_modes[digital_channel] >= IO_MODE_I2C) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_modes[digital_channel] != IO_MODE_ANALOG) {

@@ -26,6 +26,9 @@ typedef enum {
     IO_MODE_OUTPUT = 3,
     IO_MODE_ANALOG = 4,
     IO_MODE_PWM = 5,
+    IO_MODE_I2C = 6,
+    IO_MODE_SPI = 7,
+    IO_MODE_UART = 8,
 } io_mode_t;
 
 esp_err_t io_model_init(void);
@@ -40,6 +43,11 @@ esp_err_t io_model_read_digital(uint16_t channel, bool *level);
 esp_err_t io_model_get_mode(uint16_t channel, uint16_t *mode);
 esp_err_t io_model_validate_mode(uint16_t channel, uint16_t mode);
 esp_err_t io_model_set_mode(uint16_t channel, uint16_t mode);
+
+/* Peripheral drivers may reserve only idle input pins. Modbus mode writes
+ * cannot acquire or release these reservations. */
+esp_err_t io_model_reserve_pin(uint16_t channel, io_mode_t owner, bool output);
+esp_err_t io_model_release_pin(uint16_t channel, io_mode_t owner);
 
 /* Duty is in basis points: 0..10000 represents 0..100%. Settings are volatile. */
 esp_err_t io_model_pwm_configure(uint16_t channel, uint32_t frequency_hz,
